@@ -35,6 +35,7 @@
 #include "pico/audio_spdif.h"
 #include "usb_feedback_controller.h"
 #include "usb_descriptors.h"
+#include "control_inputs.h"
 #include "tusb.h"
 
 // ----------------------------------------------------------------------------
@@ -956,6 +957,7 @@ int main(void) {
 #endif
 
     core0_init();
+    control_inputs_init();
 
     // Enable watchdog
     watchdog_enable(8000, 1);
@@ -975,6 +977,9 @@ int main(void) {
         // deferred from update_master_volume() to here so we never call
         // usbd_edpt_xfer from within a control-transfer DATA stage.
         usb_notify_tick();
+
+        // Poll local encoder, RF remote, and status LED.
+        control_inputs_poll();
 
         // Drain USB audio ring — highest priority (only when USB is active input).
         // USB ISR pushes raw packets into the ring; we run the full DSP

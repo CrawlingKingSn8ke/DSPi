@@ -17,6 +17,8 @@ add_executable(DSPi
     bulk_params.c
     bulk_params.h
     config.h
+    control_inputs.c
+    control_inputs.h
     crossfeed.c
     crossfeed.h
     dcp_inline.h

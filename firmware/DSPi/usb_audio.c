@@ -343,7 +343,7 @@ static uint16_t db_to_vol[CENTER_VOLUME_INDEX + 1] = {
 
 #define ENCODE_DB(x) ((int16_t)((x)*256))
 #define MIN_VOLUME           ENCODE_DB(-CENTER_VOLUME_INDEX)
-#define DEFAULT_VOLUME       ENCODE_DB(0)
+#define DEFAULT_VOLUME       ENCODE_DB(-45)
 #define MAX_VOLUME           ENCODE_DB(0)
 #define VOLUME_RESOLUTION    ENCODE_DB(1)
 
@@ -1112,11 +1112,13 @@ static bool uac1_driver_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_cont
         if (req->bmRequestType_bit.type != TUSB_REQ_TYPE_CLASS) return true;
         if (uac1.pending_recipient == TUSB_REQ_RCPT_INTERFACE) {
             if (uac1.pending_cs == UAC1_FU_CTRL_MUTE) {
-                audio_state.mute = uac1_ctrl_buf[0];
+                // Ignore Windows USB host-mute writes. Local controls remain the real control path.
+                (void)uac1_ctrl_buf[0];
             } else if (uac1.pending_cs == UAC1_FU_CTRL_VOLUME) {
                 int16_t v;
                 memcpy(&v, uac1_ctrl_buf, sizeof(v));
-                audio_set_volume(v);
+                // Ignore Windows USB host-volume writes. Local encoder/RF remains the real listening control.
+                (void)v;
             }
         } else if (uac1.pending_recipient == TUSB_REQ_RCPT_ENDPOINT) {
             if (uac1.pending_cs == UAC1_EP_CTRL_SAMPLING_FREQ) {
@@ -1450,3 +1452,4 @@ void usb_sound_card_init(void) {
     adc_init();
     adc_set_temp_sensor_enabled(true);
 }
+
