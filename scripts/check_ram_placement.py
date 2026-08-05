@@ -146,6 +146,8 @@ RP2350_EXTRA = [
     # (folded into dsp_process_channel_block on RP2040).
     ("dspi_set_clkdiv", False),
     ("dsp_process_channel", False),
+    # Shared cascade walker behind the PEQ and crossover block kernels.
+    ("dsp_cascade_block", False),
     # Compiler/newlib mem ops; kept in RAM by the linker script exclusions.
     ("memset", False),
     ("memcpy", False),

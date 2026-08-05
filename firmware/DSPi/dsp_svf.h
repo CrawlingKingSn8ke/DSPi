@@ -451,6 +451,7 @@ static inline void dsp_svf_second_order(Filter * __restrict f, float * __restric
     f->svic1eq = ic1eq;
     f->svic2eq = ic2eq;
 }
+
 #endif // PICO_RP2350
 
 #endif // DSP_SVF_H

@@ -3,6 +3,7 @@
 #include "dsp_pipeline.h"
 #include "dsp_svf.h"
 #include "dsp_biquad.h"
+#include "dsp_cascade.h"
 #include "dcp_inline.h"
 #include "crossover.h"
 
@@ -445,13 +446,30 @@ float dsp_process_channel(Filter * __restrict filters, float input, uint8_t chan
 }
 
 DSP_TIME_CRITICAL
-void dsp_process_channel_block(Filter * __restrict filters, float * __restrict samples,
-                               uint32_t count, uint8_t channel) {
-    uint8_t num_bands = channel_band_counts[channel];
+void dsp_cascade_block(Filter * __restrict sections, uint32_t num_sections,
+                       float * __restrict samples, uint32_t count) {
+    uint32_t i = 0;
 
-    for (int band = 0; band < num_bands; band++) {
-        Filter *f = &filters[band];
-        if (f->bypass) continue;
+    while (i < num_sections) {
+        Filter *f = &sections[i];
+        if (f->bypass) { i++; continue; }
+
+        // Bypassed sections are skipped without breaking the pair around them;
+        // section order is preserved exactly.
+        uint32_t j = i + 1;
+        while (j < num_sections && sections[j].bypass) j++;
+
+        // Only biquad pairs fuse: HW A/B showed the generic fused SVF mix costs
+        // more FPU ops than the per-type specialized single kernels save in
+        // memory traffic (M33 FMA is throughput-bound, not latency-bound).
+        if (!f->first_order && !f->use_svf && j < num_sections) {
+            Filter *fn = &sections[j];
+            if (!fn->first_order && !fn->use_svf) {
+                dsp_biquad_second_order_x2(f, fn, samples, count);
+                i = j + 1;
+                continue;
+            }
+        }
 
         if (f->use_svf) {
             if (f->first_order)
@@ -464,7 +482,14 @@ void dsp_process_channel_block(Filter * __restrict filters, float * __restrict s
             else
                 dsp_biquad_second_order(f, samples, count);
         }
+        i++;
     }
+}
+
+DSP_TIME_CRITICAL
+void dsp_process_channel_block(Filter * __restrict filters, float * __restrict samples,
+                               uint32_t count, uint8_t channel) {
+    dsp_cascade_block(filters, channel_band_counts[channel], samples, count);
 }
 #else
 // RP2040: Per-sample implemented in dsp_process_rp2040.S

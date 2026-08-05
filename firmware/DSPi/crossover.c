@@ -32,8 +32,7 @@
 #include "crossover.h"
 #include "config.h"
 #include "dsp_pipeline.h"   // Filter layout, FILTER_SHIFT, FILTER_LOWPASS/HIGHPASS
-#include "dsp_svf.h"
-#include "dsp_biquad.h"
+#include "dsp_cascade.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846f
@@ -737,33 +736,6 @@ void xover_recalculate_all(float sample_rate) {
 
 #if PICO_RP2350
 DSP_TIME_CRITICAL
-static inline void apply_section_block(Filter * __restrict f,
-                                       float * __restrict samples,
-                                       uint32_t count) {
-    if (f->bypass) return;
-
-    if (f->use_svf) {
-        float a1 = f->sva1, a2 = f->sva2, a3 = f->sva3;
-        float m0 = f->svm0, m1 = f->svm1, m2 = f->svm2;
-        float ic1eq = f->svic1eq, ic2eq = f->svic2eq;
-        float *sp = samples;
-
-        if (f->first_order) {
-            dsp_svf_first_order(f, samples, count);
-            return;
-        }
-        dsp_svf_second_order(f, samples, count);
-        return;
-    }
-
-    if(f->first_order) {
-        dsp_biquad_first_order(f, samples, count);
-        return;
-    }
-    dsp_biquad_second_order(f, samples, count);
-}
-
-DSP_TIME_CRITICAL
 void xover_process_channel_block(XoverFilter *bands,
                                  float * __restrict samples,
                                  uint32_t sample_count) {
@@ -775,9 +747,7 @@ void xover_process_channel_block(XoverFilter *bands,
         // past the sections[] array on the float path too.
         uint8_t n = band->num_sections;
         if (n > MAX_XOVER_BAND_SECTIONS) n = MAX_XOVER_BAND_SECTIONS;
-        for (uint8_t s = 0; s < n; s++) {
-            apply_section_block(&band->sections[s], samples, sample_count);
-        }
+        dsp_cascade_block(band->sections, n, samples, sample_count);
     }
 }
 #else

@@ -445,7 +445,7 @@ Block-based two-phase architecture with dual-core EQ processing, all in Q28 fixe
 
 **Dual-core mode:** Core 0 handles input pipeline + matrix mix + SPDIF pair 1 (outputs 0-1), Core 1 handles SPDIF pair 2 (outputs 2-3) — both cores process per-output EQ, gain, delay, and S/PDIF conversion in parallel. PDM sub (output 4) runs on Core 1 in PDM mode; PDM and EQ worker outputs (2-3) are mutually exclusive.
 
-**Performance advantage of block-based processing:** Biquad coefficients are loaded once per biquad per block instead of once per sample. For a 2-band output channel with 192-sample blocks, this reduces coefficient loads from 384 to 2.
+**Performance advantage of block-based processing:** Biquad coefficients are loaded once per biquad per block instead of once per sample. For a 2-band output channel with 192-sample blocks, this reduces coefficient loads from 384 to 2. On RP2350 adjacent second-order biquad sections are additionally fused into one buffer sweep; see "Fused two-section cascade kernels" under Hybrid SVF/Biquad Filtering.
 
 ---
 
@@ -635,7 +635,7 @@ Single-precision throughout. Per-band SVF or TDF2 biquad path selected at coeffi
 Q28 fixed-point. Both per-sample and block-based biquad processing implemented in hand-optimized ARM assembly (`dsp_process_rp2040.S`). Block-based `dsp_process_channel_block()` keeps s1/s2 state in high registers across the entire sample loop, shares operand decompositions across multiply groups, and uses r12 for intermediate saves — eliminating per-sample struct access, function call overhead, and redundant decompositions vs the C `fast_mul_q28()` version.
 
 ### Hybrid SVF/Biquad Filtering (RP2350)
-*Last updated: 2026-07-12*
+*Last updated: 2026-08-05*
 
 The RP2350 uses a hybrid filter architecture that selects between a State Variable Filter (SVF) and a Transposed Direct Form II (TDF2) biquad on a per-band basis. This provides better numerical stability at low frequencies (where single-precision biquad pole quantization is worst) while retaining the efficiency of biquads at higher frequencies.
 
@@ -665,6 +665,18 @@ Where `g = tan(pi * freq / Fs)` and `A = 10^(gain_dB/40)`.
 **First-order (one-pole) SVF (added 2026-06-20):** First-order types (`FILTER_ALLPASS1`, `FILTER_LOWSHELF1`, `FILTER_HIGHSHELF1`, and the crossover BW1 / odd-order 1st-order sections) cannot use the 2nd-order SVF, so below `Fs/7.5` they run a one-pole TPT integrator instead: `v1 = sva2*in + sva1*ic1; ic1 = 2*v1 - ic1`, output `m0*in + m1*v1 + m2*(in - v1)` (lp = v1, hp = in - v1). The `1/(1+g)` reciprocal is folded into `sva1` (with `sva2 = g*sva1`) so the loop is multiply-only; only `svic1eq` is used. The path is gated by `bq->svf_first_order`. Above `Fs/7.5` these run a degenerate TDF2 biquad, exactly as the 2nd-order types switch to biquad. This makes first-order types follow the identical hybrid rule as every other type (previously they were forced to TDF2 at every frequency).
 
 **Linkwitz Transform SVF (added 2026-07-12):** The Linkwitz Transform (`FILTER_LINKWITZ_TRANSFORM`) is realized on the hybrid path as a full 2nd-order Simper SVF tuned at the **pole** pair: `g = tan(pi*fp/Fs)`, `k = 1/Qp`, with the output mix `m0 = 1`, `m1 = (g0/g)/Q0 - k`, `m2 = (g0/g)^2 - 1` (where `g0 = tan(pi*f0/Fs)` encodes the driver's measured corner). The SVF form is used only when **both** corners (`f0` and `fp`) sit below `Fs/7.5`; if either corner is at or above the boundary the band falls back to the exact-bilinear TDF2 biquad with both corners independently prewarped. This both-corners rule differs from the single-frequency test the other types use, because the transform's zero and pole must both be in the SVF-accurate region for the realizations to match.
+
+**Fused two-section cascade kernels (added 2026-08-05, biquad-only since 2026-08-05, RP2350 only):** The block kernels used to be strictly band-major: every active band did its own read-modify-write sweep of the sample buffer, so an N-band cascade moved the block through memory N times. `dsp_cascade_block()` (`dsp_pipeline.c`, declared in `dsp_cascade.h`) now walks the cascade and, whenever the next two active sections are **both second-order biquads**, runs them through one fused kernel: `dsp_biquad_second_order_x2()` (`dsp_biquad.h`). Each sample is loaded once, pushed through both sections while it stays in registers, and stored once, so a fused pair halves buffer traffic and loop administration versus two sweeps at identical FP-op count (12 FP ops per sample-pair). Hardware A/B on the CPU meter measured this at 5-10 % less EQ cost on biquad-heavy cascades.
+
+SVF sections are **never fused**. A fused SVF variant was built and measured on hardware: because the single SVF kernel is switch-specialized per filter type (e.g. the peaking mix is a single FMA) while a fused kernel must use the generic three-term mix, fusion added FPU ops that outweighed the saved memory traffic (+14 % on peaking-heavy cascades). The measurement also established that the M33 FMA pipeline is throughput-bound, not latency-bound: interleaving two independent recurrences gains nothing, and loads/stores already overlap FPU work, so only reducing FP-op count pays on this core.
+
+Dispatch rules:
+- Section order is preserved exactly; bypassed sections are skipped and do not break the pair around them.
+- First-order sections, SVF sections, and mixed biquad/SVF neighbours are never fused; they fall back to the existing single kernels.
+- The fused biquad kernel uses the **generic** TDF2 coefficient form for both sections regardless of `filter_type`. The per-type specializations in the single kernels only exploit coefficient equalities, so the generic form is correct for every second-order type; the target compiler forms the same FMA contractions in both, so on RP2350 results are bit-identical in practice.
+- The walker is shared: the crossover kernel (`xover_process_channel_block()`) calls the same `dsp_cascade_block()` per band, which pairs crossover cascades whose sections are on the biquad path (above `Fs/7.5`); SVF crossover sections run as single sweeps. It is deliberately **out-of-line** so the unrolled kernel bodies are emitted into RAM once rather than duplicated into both callers; this made RP2350 `.text` and RAM image ~3.3 KB *smaller* than the pre-fusion band-major code.
+
+RP2040 is unaffected: its band-major assembly kernels (`dsp_process_rp2040.S`) and their dispatch are unchanged.
 
 **State reset:** When a band changes filter topology — crossing the SVF/biquad boundary (e.g. due to sample rate change) or switching between the one-pole and 2nd-order SVF (`bq->svf_first_order` flips) — both biquad state (`s1`, `s2`) and SVF state (`svic1eq`, `svic2eq`) are reset to zero to prevent transients.
 
@@ -723,7 +735,7 @@ PDM sub gets automatic alignment compensation: +SUB_ALIGN_SAMPLES (128 samples =
 ---
 
 ## Crossover Filters
-*Last updated: 2026-06-20*
+*Last updated: 2026-08-05*
 
 ### Purpose
 
@@ -762,7 +774,7 @@ Implemented as `xover_process_channel_block()` calls in:
 - `audio_pipeline.c` single-core and dual-core branches on both platforms (4 sites)
 - `pdm_generator.c` Core 1 EQ worker on both platforms (2 sites)
 
-Kernel reuses the existing per-section TDF2 (RP2040) and SVF/TDF2 (RP2350) inner loops. RP2040 calls a new assembly entry point `dsp_process_band_cascade_block` that shares the inner-loop body with `dsp_process_channel_block` via local labels — only the band-loop terminator differs (parameter-supplied `num_sections` vs `channel_band_counts[channel]` lookup).
+Kernel reuses the existing per-section TDF2 (RP2040) and SVF/TDF2 (RP2350) inner loops. RP2040 calls a new assembly entry point `dsp_process_band_cascade_block` that shares the inner-loop body with `dsp_process_channel_block` via local labels — only the band-loop terminator differs (parameter-supplied `num_sections` vs `channel_band_counts[channel]` lookup). Since 2026-08-05 the RP2350 side calls the shared `dsp_cascade_block()` per band, so a crossover cascade of second-order biquad-path sections pairs into fused two-section sweeps (SVF sections stay single; see "Fused two-section cascade kernels").
 
 ### State
 
@@ -1834,6 +1846,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | Parallel EQ | Core 0: input + 0-1, Core 1: 2-3 | Core 0: input + 0-1, Core 1: 2-7 |
 | Parallel crossover (V11+) | Same dispatch as PEQ — Core 1 owns its output range | Same dispatch as PEQ |
 | EQ worker data type | int32_t Q28, block-based | float, block-based, hybrid SVF/biquad |
+| EQ cascade structure | Band-major: one buffer sweep per band (assembly) | Paired: adjacent 2nd-order biquad bands fused into one sweep, SVF bands single (`dsp_cascade_block`) |
 | Crossover-stage availability when PDM enabled | Single-core (Core 0 only) | Single-core (Core 0 only) |
 
 ### DMA
