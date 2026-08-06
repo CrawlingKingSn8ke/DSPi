@@ -86,6 +86,7 @@ DSPi is a USB Audio Class 1 (UAC1) digital signal processor built on the Raspber
 | `i2s_input.c` | I2S RX integration: master/slave PIO lifecycle, IRQ-less DMA ring, poll into pipeline |
 | `i2s_input.h` | I2S input API (start/stop/resync/poll), state enum |
 | `i2s_input.pio` | I2S RX PIO programs (clock-master and wait-driven slave variants) |
+| `input_capture_arena.h` | Shared capture-buffer union (SPDIF FIFO / I2S rings / ADAT ring) + ownership claim/release API |
 | `flash_storage.c` | Parameter save/load to last 4KB flash sector |
 | `flash_storage.h` | Flash storage API |
 | `bulk_params.c` | Bulk parameter collect/apply (wire format ↔ live state) |
@@ -1775,7 +1776,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## RP2040 vs RP2350 Comparison
-*Last updated: 2026-08-04 (Control Surfaces caps v7; loudness ref-SPL and intensity nouns on both platforms)*
+*Last updated: 2026-08-06 (input capture arena row: the SPDIF/I2S/ADAT capture buffers now overlay one shared arena)*
 
 ### Hardware
 
@@ -1818,6 +1819,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | USB input channels | 2 (stereo) | 2 / 4 / 6 / 8 |
 | I2S input channels | 2 (stereo) | 2 / 4 / 6 / 8 (configurable) |
 | ADAT input | Config state only (never selectable) | Yes (8 ch, 24-bit, 44.1/48 kHz; master/slave clock; PIO1 SM2 + DMA CH15) |
+| Input capture arena (shared SPDIF FIFO / I2S rings / ADAT ring) | 12,288 B, 4096-aligned (SPDIF FIFO is the largest member) | 32,768 B, 8192-aligned (the four I2S rings are the largest member) |
 | USB input bit depth | 16-bit or 24-bit (alt) | 16/24-bit (stereo) or 16-bit (multichannel) |
 | AS alt settings | 0, 1 (16-bit), 2 (24-bit) | 0, 1, 2, 3 (4ch), 4 (6ch), 5 (8ch) |
 | Wire / slot version | V28 / V35 | V28 / V35 |
@@ -1902,7 +1904,17 @@ masked, and PDM claims its channel once at init.
 ---
 
 ## Memory Layout
-*Last updated: 2026-07-19 (RP2350 stereo upmixer adds ~12.3 KB BSS: Haas + allpass rings sized for 48 kHz, estimators, double-buffered coeffs; RP2040 unchanged, feature compiled out)*
+*Last updated: 2026-08-06 (input capture arena overlays the SPDIF/I2S/ADAT capture buffers: -20,480 B BSS on RP2350, -4,092 B on RP2040)*
+
+> **Input capture arena (2026-08-06).** The `pico_spdif_rx` FIFO (12 KB), the I2S
+> RX rings (4 KB RP2040 / 32 KB RP2350) and the ADAT RX ring (8 KB, RP2350 only)
+> are mutually exclusive and now overlay one BSS union, `input_capture_arena`
+> (`.bss.input_capture_arena`, first in the alignment-sorted `.bss` cluster).
+> Size is the largest member: **12,288 B on RP2040** (4096-aligned) and
+> **32,768 B on RP2350** (8192-aligned), reclaiming 4,092 B and 20,480 B of BSS
+> respectively. The explicit section keeps it out of COMMON, where its alignment
+> padding would eat most of the saving. Ownership is a runtime-checked invariant;
+> see "Input Capture Arena" under Audio Input Source System.
 
 > **Linkwitz Transform target-Q sidecar (2026-07-12).** The Linkwitz Transform's
 > fourth parameter (`Qp`) is stored out-of-band in a new BSS array
@@ -1937,9 +1949,10 @@ masked, and PDM claims its channel once at init.
 > control paths stay cold in flash. RP2040 compiles the engine out entirely
 > (zero cost). See "ADAT Bulk Output".
 
-> **ADAT bulk input (2026-07-13, acquisition state updated 2026-07-15; RP2350 only).** The ADAT receiver adds a fixed
-> **8 KB BSS ring** (`adat_rx_ring`, 2048 x uint32, aligned to its own size for the
-> DMA write-address wrap) plus a few dozen bytes of state (including the current
+> **ADAT bulk input (2026-07-13, acquisition state updated 2026-07-15; ring moved into the shared arena 2026-08-06; RP2350 only).** The ADAT receiver uses a fixed
+> **8 KB ring** (`adat_rx_ring`, 2048 x uint32, aligned to its own size for the
+> DMA write-address wrap; since 2026-08-06 it is a member of the shared
+> `input_capture_arena` and costs no BSS of its own) plus a few dozen bytes of state (including the current
 > slave probe rate and its 64-bit start timestamp), and roughly **3 KB of
 > RAM-pinned decode code**: the `DSP_TIME_CRITICAL` poll body, header check, frame
 > decoder, slave-mode rate machine, and clock servo. The bounded sync-search scan
@@ -3142,7 +3155,7 @@ Master volume is re-derived on every preset *context* change (preset load, activ
 ---
 
 ## Audio Input Source System
-*Last updated: 2026-07-13 (ADAT input added as source 3, RP2350 only; see "ADAT Input")*
+*Last updated: 2026-08-06 (input capture arena + receiver exclusivity invariant; see "Input Capture Arena")*
 
 Abstraction layer enabling selection between multiple audio input sources. Supports USB (default), up to three SPDIF inputs, I2S, and (RP2350 only) an 8-channel ADAT lightpipe input.
 
@@ -3188,6 +3201,29 @@ Up to `SPDIF_RX_NUM_INPUTS` (4) SPDIF inputs share the single RX PIO state machi
 - When input is not USB, `usb_audio_drain_ring()` is skipped — USB enumeration stays active but audio data is silently dropped
 - SPDIF RX hardware only runs when SPDIF is the selected input source; I2S RX hardware only runs when I2S is the selected input source. The two share the same PIO SM and DMA channels, which is safe because inputs are switched, never mixed. The four SPDIF inputs likewise share the single RX SM/DMA pair; switching between them runs the same full stop/restart so only the active input's GPIO is ever claimed
 - Switching to I2S applies the selected `i2s_input_rate` (via `perform_rate_change()` when it differs from the current rate), then runs the same drain/prefill-to-50%/enable-in-sync handshake as SPDIF (minus the lock wait, since the synchronous input runs as soon as it is started). See the I2S Input prefill note below
+
+### Input Capture Arena
+*Last updated: 2026-08-06 (new: the three capture buffers overlay one arena; receiver exclusivity is now a checked invariant)*
+
+The three input receivers never run at the same time, so their capture buffers share one BSS arena (`firmware/DSPi/input_capture_arena.h`, defined in `audio_input.c`):
+
+| Member | Owner | RP2040 | RP2350 |
+|--------|-------|--------|--------|
+| `spdif_fifo` | `pico_spdif_rx`'s `fifo_buff` | 12,288 B | 12,288 B |
+| `i2s_ring` | `i2s_input.c`'s `i2s_rx_ring` | 4,096 B (1 pair) | 32,768 B (4 pairs) |
+| `adat_ring` | `adat_input.c`'s `adat_rx_ring` | n/a | 8,192 B |
+| **Arena** | union, aligned to the largest member's DMA wrap | **12,288 B / 4096-aligned** | **32,768 B / 8192-aligned** |
+
+This reclaims 4,092 B of BSS on RP2040 and 20,480 B on RP2350. Each module aliases its old symbol name onto its member with a macro, so all other references are unchanged, and each static-asserts its own ring constants against the arena geometry. The arena's alignment equals one I2S row, which is what keeps every row inside its own DMA write-address wrap region; the ADAT ring wraps on the whole 8 KB member. The SPDIF FIFO is chained ping-pong DMA (no address wrap) and needs only 4-byte alignment. Buffers deliberately **not** in the arena: `adat_ring` (ADAT *output*, runs with any input), the consumer pools, `pdm_dma_buffer`, and the USB `audio_ring`.
+
+**Ownership invariant.** At most one receiver runs, and only the one the active source owns. `input_arena_claim()` panics if the arena is already held by a different owner; each `*_input_start()` claims (USB claims nothing) and each `*_input_stop()` releases. Two enforcement points keep the invariant true rather than merely asserted:
+
+- `stop_foreign_input_receivers(keep)` (main.c) stops every receiver that is *actually running* but is not `keep`, keyed on running state rather than on the old source enum. It runs once per main-loop iteration, at the top of the deferred source switch (with the incoming source as `keep`, making the per-branch stops no-ops), and at the restart points of preset load, factory reset and bulk apply.
+- Those three paths matter because `apply_factory_defaults()` writes `active_input_source = INPUT_SOURCE_USB` directly, bypassing the deferred switch handler; before this, a factory reset / empty-slot preset load / active-slot preset delete while ADAT was live left the ADAT receiver running (ENDLESS DMA into its ring) with no path that would ever stop it, since the switch handler's stop chain keys on the old source. SPDIF and I2S were already interlocked by their shared DMA channels and PIO SM; ADAT has its own (DMA 15, PIO1 SM2), so only convention protected it.
+
+The flash-blackout behavior is unchanged: ADAT may keep running through a blackout while it *remains* the active source (see "ADAT Input", flash-write bracket).
+
+**SPDIF teardown alarm race.** `spdif_rx_end()` now sets a `shutting_down` flag before cancelling the pending alarm (both under `save_and_disable_interrupts()`), and every alarm callback plus the DMA IRQ handler returns immediately when it is set; `spdif_rx_start()` clears it. An alarm that had already latched could otherwise fire inside the teardown window, re-run `_spdif_rx_capture_start()` (re-claiming DMA and re-arming a write into the shared FIFO) and schedule a successor the teardown never cancels, chaining a retry every 100 ms behind a stopped receiver.
 
 ### USB Behavior While Non-USB Input is Active (2026-05-04)
 
@@ -3396,7 +3432,7 @@ The helper `i2s_effective_bck_pin()` resolves the pair the active clock mode act
 
 **Flash-write bracket.** `prepare_flash_write_operation()` treats a LOCKED ADAT input as a live source: it appears in the pre-mute drain, the streaming test, and the fade-settle loop (which calls `adat_input_poll()` until both the settle interval and the DAC hardware-mute hold have elapsed), matching the guarantees given to USB/SPDIF/I2S (see "DAC Hardware Mute"). Unlike SPDIF and I2S, ADAT is deliberately NOT stopped for the ~45 ms blackout: its RX is an IRQ-less free-running DMA ring with no decode-timeout alarms to race the blackout edge, and the poll re-acquires frame sync after the ring laps; `preset_loading` (still set from `prepare_pipeline_reset()`) then re-runs the drain/prefill/enable handshake once LOCKED returns.
 
-**Resources.** PIO1 SM2 (PIO1 SM0 = PDM, SM1 = ADAT TX); DMA channel 15 (RX ring, ENDLESS mode, no IRQ). The 8 KB `adat_rx_ring` is fixed BSS; the decode hot path (`adat_input_poll`, `adat_rx_header_ok`, `adat_rx_decode_frame`, `adat_rx_rate_machine`, `adat_input_update_clock_servo`) is `DSP_TIME_CRITICAL` and RAM-resident (the acquisition probe/header scan stays cold in flash, since it runs only while muted). See "Memory Layout".
+**Resources.** PIO1 SM2 (PIO1 SM0 = PDM, SM1 = ADAT TX); DMA channel 15 (RX ring, ENDLESS mode, no IRQ). The 8 KB `adat_rx_ring` lives in the shared `input_capture_arena` (see "Input Capture Arena"); the decode hot path (`adat_input_poll`, `adat_rx_header_ok`, `adat_rx_decode_frame`, `adat_rx_rate_machine`, `adat_input_update_clock_servo`) is `DSP_TIME_CRITICAL` and RAM-resident (the acquisition probe/header scan stays cold in flash, since it runs only while muted). See "Memory Layout".
 
 **Persistence.** ADAT input config persists like the optional SPDIF inputs (disabled by default, pin `0xFF` = unset, GPIO claimed only while ADAT is the active source). `WireInputConfig` (V24) gains `adat_input_pin`, `adat_input_enabled_p1` (enable + 1; 0 absent), and `adat_clock_mode_p1` (mode + 1; 0 absent, 1 master, 2 slave). The fields also ride `PresetSlot` (`SLOT_DATA_VERSION` 32) and the device-global `FlashOutputConfig` (`DIR_VERSION` 15), honoring `output_config_mode` exactly like the other physical-IO config. Vendor commands: `REQ_SET/GET_ADAT_INPUT_ENABLE` (0x68/0x69), `REQ_SET/GET_ADAT_INPUT_PIN` (0x6A/0x6B), `REQ_SET/GET_ADAT_INPUT_CLOCK_MODE` (0x6C/0x6D), `REQ_GET_ADAT_INPUT_STATUS` (0x6E); 0x6F reserved.
 

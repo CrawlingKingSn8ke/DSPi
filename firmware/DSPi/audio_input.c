@@ -6,6 +6,33 @@
  */
 
 #include "audio_input.h"
+#include "input_capture_arena.h"
+#include "pico/stdlib.h"
+
+// Shared capture storage for the mutually exclusive input receivers.  The
+// explicit section keeps it out of COMMON, where its alignment would cost
+// more padding than the overlay saves.
+InputCaptureArena __attribute__((section(".bss.input_capture_arena")))
+    input_capture_arena;
+static InputArenaOwner arena_owner = INPUT_ARENA_FREE;
+
+void input_arena_claim(InputArenaOwner owner) {
+    // A second live owner would write another receiver's ring; fail loudly at
+    // the start that broke the exclusivity invariant, not later in the audio.
+    if (arena_owner != INPUT_ARENA_FREE && arena_owner != owner) {
+        panic("input capture arena busy: owner %d, claim %d",
+              (int)arena_owner, (int)owner);
+    }
+    arena_owner = owner;
+}
+
+void input_arena_release(InputArenaOwner owner) {
+    if (arena_owner == owner) arena_owner = INPUT_ARENA_FREE;
+}
+
+InputArenaOwner input_arena_get_owner(void) {
+    return arena_owner;
+}
 
 // Active input source — default to USB
 volatile uint8_t active_input_source = INPUT_SOURCE_USB;

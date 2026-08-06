@@ -87,6 +87,10 @@ void adat_input_on_rate_change(uint32_t freq);
 uint32_t adat_input_current_tx_divider(void);
 
 AdatInputState adat_input_get_state(void);
+
+// True while the receiver hardware is claimed and the RX ring DMA is live.
+// The authority for the exclusivity invariant (state can lag on the way in).
+bool adat_input_is_running(void);
 uint32_t adat_input_get_detected_rate(void);
 void adat_input_get_status(AdatInputStatusPacket *out);
 
