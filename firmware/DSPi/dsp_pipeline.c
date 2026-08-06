@@ -445,6 +445,11 @@ float dsp_process_channel(Filter * __restrict filters, float input, uint8_t chan
     return sample;
 }
 
+// A/B knob: 1 fuses shelf/Linkwitz SVF pairs (the generic arm), 0 leaves them
+// as singles.  Both settings are bit-identical; this only trades RAM text for
+// speed on the generic arm.
+#define DSPI_FUSE_GENERIC_SVF_PAIRS 1
+
 DSP_TIME_CRITICAL
 void dsp_cascade_block(Filter * __restrict sections, uint32_t num_sections,
                        float * __restrict samples, uint32_t count) {
@@ -459,15 +464,25 @@ void dsp_cascade_block(Filter * __restrict sections, uint32_t num_sections,
         uint32_t j = i + 1;
         while (j < num_sections && sections[j].bypass) j++;
 
-        // Only biquad pairs fuse: HW A/B showed the generic fused SVF mix costs
-        // more FPU ops than the per-type specialized single kernels save in
-        // memory traffic (M33 FMA is throughput-bound, not latency-bound).
-        if (!f->first_order && !f->use_svf && j < num_sections) {
+        // Second-order sections fuse only with a partner on the same path AND
+        // in the same kernel arm, so each keeps its specialized op count and
+        // still saves a load/store per sample.  A cross-arm pair would force
+        // the generic mix on a specialized section and cost more than it saves.
+        if (!f->first_order && j < num_sections) {
             Filter *fn = &sections[j];
-            if (!fn->first_order && !fn->use_svf) {
-                dsp_biquad_second_order_x2(f, fn, samples, count);
-                i = j + 1;
-                continue;
+            if (!fn->first_order && fn->use_svf == f->use_svf) {
+                if (!f->use_svf) {
+                    dsp_biquad_second_order_x2(f, fn, samples, count);
+                    i = j + 1;
+                    continue;
+                }
+                DspSvfArm arm = dsp_svf_arm_class(f);
+                if (arm == dsp_svf_arm_class(fn) &&
+                    (DSPI_FUSE_GENERIC_SVF_PAIRS || arm != DSP_SVF_ARM_GENERIC)) {
+                    dsp_svf_second_order_x2(f, fn, samples, count);
+                    i = j + 1;
+                    continue;
+                }
             }
         }
 

@@ -667,15 +667,18 @@ Where `g = tan(pi * freq / Fs)` and `A = 10^(gain_dB/40)`.
 
 **Linkwitz Transform SVF (added 2026-07-12):** The Linkwitz Transform (`FILTER_LINKWITZ_TRANSFORM`) is realized on the hybrid path as a full 2nd-order Simper SVF tuned at the **pole** pair: `g = tan(pi*fp/Fs)`, `k = 1/Qp`, with the output mix `m0 = 1`, `m1 = (g0/g)/Q0 - k`, `m2 = (g0/g)^2 - 1` (where `g0 = tan(pi*f0/Fs)` encodes the driver's measured corner). The SVF form is used only when **both** corners (`f0` and `fp`) sit below `Fs/7.5`; if either corner is at or above the boundary the band falls back to the exact-bilinear TDF2 biquad with both corners independently prewarped. This both-corners rule differs from the single-frequency test the other types use, because the transform's zero and pole must both be in the SVF-accurate region for the realizations to match.
 
-**Fused two-section cascade kernels (added 2026-08-05, biquad-only since 2026-08-05, RP2350 only):** The block kernels used to be strictly band-major: every active band did its own read-modify-write sweep of the sample buffer, so an N-band cascade moved the block through memory N times. `dsp_cascade_block()` (`dsp_pipeline.c`, declared in `dsp_cascade.h`) now walks the cascade and, whenever the next two active sections are **both second-order biquads**, runs them through one fused kernel: `dsp_biquad_second_order_x2()` (`dsp_biquad.h`). Each sample is loaded once, pushed through both sections while it stays in registers, and stored once, so a fused pair halves buffer traffic and loop administration versus two sweeps. Since 2026-08-05 the kernel also carries per-type specialized arms (see dispatch rules below), so a fused pair costs no more FP ops than the two single sweeps it replaces. Hardware A/B against a build with pairing disabled measures the specialized fused kernel at 19 % less EQ cost on peaking-heavy biquad cascades, 17 % on shelf-heavy ones, and 8 % on LR8 crossovers; against the earlier generic-only fused kernel it is 13 % better on peaking and 8 % on crossovers. Cost is ~1.2 KB of RAM text.
+**Fused two-section cascade kernels (added 2026-08-05, extended to SVF pairs 2026-08-06, RP2350 only):** The block kernels used to be strictly band-major: every active band did its own read-modify-write sweep of the sample buffer, so an N-band cascade moved the block through memory N times. `dsp_cascade_block()` (`dsp_pipeline.c`, declared in `dsp_cascade.h`) now walks the cascade and, whenever the next two active sections are second-order and on the **same** path, runs them through one fused kernel: `dsp_biquad_second_order_x2()` (`dsp_biquad.h`) for biquad-path pairs, `dsp_svf_second_order_x2()` (`dsp_svf.h`) for SVF-path pairs. Each sample is loaded once, pushed through both sections while it stays in registers, and stored once, so a fused pair halves buffer traffic and loop administration versus two sweeps. Since 2026-08-05 the kernel also carries per-type specialized arms (see dispatch rules below), so a fused pair costs no more FP ops than the two single sweeps it replaces. Hardware A/B against a build with pairing disabled measures the specialized fused kernel at 19 % less EQ cost on peaking-heavy biquad cascades, 17 % on shelf-heavy ones, and 8 % on LR8 crossovers; against the earlier generic-only fused kernel it is 13 % better on peaking and 8 % on crossovers. Cost is ~1.2 KB of RAM text.
 
-SVF sections are **never fused**. A fused SVF variant was built and measured on hardware: because the single SVF kernel is switch-specialized per filter type (e.g. the peaking mix is a single FMA) while a fused kernel must use the generic three-term mix, fusion added FPU ops that outweighed the saved memory traffic (+14 % on peaking-heavy cascades). The measurement also established that the M33 FMA pipeline is throughput-bound, not latency-bound: interleaving two independent recurrences gains nothing, and loads/stores already overlap FPU work, so only reducing FP-op count pays on this core.
+**SVF pairs (added 2026-08-06).** An earlier fused SVF kernel that forced the generic three-term output mix on every pair was measured on hardware at +14 % on peaking-heavy cascades and removed: the extra FPU ops outweighed the saved memory traffic, because the single SVF kernel is switch-specialized per filter type. `dsp_svf_second_order_x2()` repeats the biquad kernel's fix instead: each arm reuses the matching single-kernel output expression, so no fused section ever pays for another type's mix, and the pair still collects the load/store saving. Hardware A/B at 48 kHz / 307.2 MHz over 17 channels measures the SVF band-sweep slope falling from 2.29 to 1.85 % CPU per band (-19 %); on 10-band cascades the EQ cost (net of the flat-pipeline floor) drops 17 % for peaking, 21 % for an 8-active/2-bypassed load, 8 % for shelves, and 9 % for an LR8 HP+LP crossover whose SVF high-pass sections now pair. Biquad-path rows and SVF/biquad alternations are unchanged, as expected. Cost is ~4.1 KB of RAM text for the specialized arms plus ~1.2 KB for the generic arm.
+
+The M33 FMA pipeline is throughput-bound, not latency-bound: interleaving two independent recurrences gains nothing, and loads/stores already overlap FPU work, so only reducing FP-op count pays on this core. That is why arm-for-arm op-count parity, not fusion itself, is the load-bearing property.
 
 Dispatch rules:
 - Section order is preserved exactly; bypassed sections are skipped and do not break the pair around them.
-- First-order sections, SVF sections, and mixed biquad/SVF neighbours are never fused; they fall back to the existing single kernels.
+- First-order sections and mixed biquad/SVF neighbours are never fused; they fall back to the existing single kernels. Two second-order sections fuse only when they share a path (`use_svf`) **and**, on the SVF path, the same kernel arm.
 - The fused biquad kernel picks one of three loop bodies **once per call**, never per sample: a peaking arm when both sections are `FILTER_PEAKING` (each section reuses the single kernel's `b1 = a1` form, 8 FP ops per section per sample), an LP/HP arm when both sections are `FILTER_LOWPASS` or `FILTER_HIGHPASS` in any combination (each reuses the `b0 = b2` form with the `b0*x` product computed once, also 8 ops), and the generic TDF2 form for everything else (9 ops). Because each arm's expressions match the corresponding single-kernel arm exactly, a fused sweep is bit-identical to two sequential single sweeps for those types, verified over 240 host cases covering every tail remainder and state carry-over. `FILTER_NOTCH` and `FILTER_ALLPASS` pairs (7 ops each) are deliberately **not** specialized: adjacent same-type notch or all-pass pairs are rare in practice and each extra arm costs ~580 bytes of RAM text against an already-exceeded `.data` budget.
-- The walker is shared: the crossover kernel (`xover_process_channel_block()`) calls the same `dsp_cascade_block()` per band, which pairs crossover cascades whose sections are on the biquad path (above `Fs/7.5`); SVF crossover sections run as single sweeps. It is deliberately **out-of-line** so the unrolled kernel bodies are emitted into RAM once rather than duplicated into both callers; this made RP2350 `.text` and RAM image ~3.3 KB *smaller* than the pre-fusion band-major code.
+- The fused SVF kernel picks its loop body once per call from `dsp_svf_arm_class()` (`dsp_svf.h`), which buckets a section into one of three arms: `LPHP` (`FILTER_LOWPASS` / `FILTER_HIGHPASS`), `PEAK` (`FILTER_PEAKING` / `FILTER_NOTCH` / `FILTER_ALLPASS`, which share one arm in the single kernel), and `GENERIC` (shelves, Linkwitz Transform, anything else). Only equal-class neighbours pair, so each fused section keeps its single-kernel op count; the `LPHP` arm splits further into the four low/high-pass orderings because low-pass emits `v2` directly while high-pass needs the three-term mix. Bit-exactness against two sequential single sweeps is verified over 440 host cases covering every arm, all four `LPHP` orderings, every tail remainder, and state carry-over across calls. `DSPI_FUSE_GENERIC_SVF_PAIRS` in `dsp_pipeline.c` gates the generic arm; it is on because hardware measured shelf cascades 12 % cheaper with it than without.
+- The walker is shared: the crossover kernel (`xover_process_channel_block()`) calls the same `dsp_cascade_block()` per band, so crossover cascades pair on both paths: biquad sections above `Fs/7.5`, and SVF sections below it through the `LPHP` arm (every second-order crossover section carries `FILTER_LOWPASS` or `FILTER_HIGHPASS`). It is deliberately **out-of-line** so the unrolled kernel bodies are emitted into RAM once rather than duplicated into both callers; this made RP2350 `.text` and RAM image ~3.3 KB *smaller* than the pre-fusion band-major code.
 
 RP2040 is unaffected: its band-major assembly kernels (`dsp_process_rp2040.S`) and their dispatch are unchanged.
 
@@ -687,7 +690,7 @@ RP2040 is unaffected: its band-major assembly kernels (`dsp_process_rp2040.S`) a
 
 **FP contraction (added 2026-08-05, RP2350 only):** `dsp_pipeline.c` is compiled with `-ffp-contract=off`, so the EQ kernels use separate VMUL/VADD instead of fused VFMA. Hardware measurement on the CPU meter established that the M33 FMA pipeline is throughput-bound with an effective VFMA occupancy of roughly 2 to 2.5 cycles versus 1 for VMUL/VADD: de-contraction emits ~58 % more FP instructions (and eliminates the VMOV accumulator copies VFMA's destructive form forces) yet measures 14 to 24 % less EQ cost on every kernel path, SVF and biquad alike, with no register spills. Loads/stores already overlap FPU issue, so FP-op *occupancy* is the only currency that matters in these loops. That is why the fused kernel only became worthwhile once its arms were specialized to match the single kernels' op counts (above): while it used the generic 9-op form it was giving back most of what the saved memory traffic won. Precision cost of double rounding is negligible and was verified on hardware: loopback THD, noise floor, and flat-path residual byte-identical to the contracted build, filter responses within 0.01 dB, and host analysis puts the noise penalty at ~1.5 dB on a −137 dB re-signal error floor. The flag is per-file: other DSP translation units (loudness, psybass, leveller, crossfeed, upmix) still contract and are candidates for the same measure-then-decide treatment.
 
-*Last updated: 2026-08-05*
+*Last updated: 2026-08-06*
 
 **Memory impact:** Biquad struct grows from ~48 to ~68 bytes on RP2350. With 110 EQ biquads at the larger size: ~3 KB additional BSS. (Loudness no longer uses the full `Biquad` struct; since 2026-07-09 its per-output shelf state is a separate minimal array, `loudness_output_state`, 144 B on RP2350 / 80 B on RP2040.)
 
@@ -1776,7 +1779,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## RP2040 vs RP2350 Comparison
-*Last updated: 2026-08-06 (input capture arena row: the SPDIF/I2S/ADAT capture buffers now overlay one shared arena)*
+*Last updated: 2026-08-06 (input capture arena row; EQ cascade row: SVF pairs now fuse too)*
 
 ### Hardware
 
@@ -1852,7 +1855,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | Parallel EQ | Core 0: input + 0-1, Core 1: 2-3 | Core 0: input + 0-1, Core 1: 2-7 |
 | Parallel crossover (V11+) | Same dispatch as PEQ — Core 1 owns its output range | Same dispatch as PEQ |
 | EQ worker data type | int32_t Q28, block-based | float, block-based, hybrid SVF/biquad |
-| EQ cascade structure | Band-major: one buffer sweep per band (assembly) | Paired: adjacent 2nd-order biquad bands fused into one sweep with per-type specialized arms, SVF bands single (`dsp_cascade_block`) |
+| EQ cascade structure | Band-major: one buffer sweep per band (assembly) | Paired: adjacent 2nd-order bands on the same path (biquad or SVF) fused into one sweep with per-type specialized arms (`dsp_cascade_block`) |
 | Crossover-stage availability when PDM enabled | Single-core (Core 0 only) | Single-core (Core 0 only) |
 
 ### DMA
@@ -1904,7 +1907,7 @@ masked, and PDM claims its channel once at init.
 ---
 
 ## Memory Layout
-*Last updated: 2026-08-06 (input capture arena overlays the SPDIF/I2S/ADAT capture buffers: -20,480 B BSS on RP2350, -4,092 B on RP2040)*
+*Last updated: 2026-08-06 (input capture arena overlays the SPDIF/I2S/ADAT capture buffers: -20,480 B BSS on RP2350, -4,092 B on RP2040; RP2350 .data +5,256 B for the fused SVF pair arms)*
 
 > **Input capture arena (2026-08-06).** The `pico_spdif_rx` FIFO (12 KB), the I2S
 > RX rings (4 KB RP2040 / 32 KB RP2350) and the ADAT RX ring (8 KB, RP2350 only)
@@ -2124,9 +2127,9 @@ and warns on flash reached through linker long-call veneers (cold paths); Check
 | Stereo upmixer state (Haas 2 × 1024 + allpass 2 × 512 floats + estimators + double-buffered coeffs) | ~12.3 KB |
 | Other BSS | ~35 KB |
 | **Total BSS** | **~346 KB** (measured 353,884 B after the stereo upmixer, + ~12.3 KB over the prior build. RP2040 unchanged: the feature is compiled out and the matrix is untouched) |
-| RAM code+rodata+data (.data section, hot set only) | 70,520 B (was 147,332 under copy_to_ram) |
+| RAM code+rodata+data (.data section, hot set only) | 84,360 B (was 147,332 under copy_to_ram; +5,256 B for the fused SVF pair arms, 2026-08-06). Over the 73,728 B `check_ram_placement.py` budget, which now fails by 10,632 B; the budget has not been re-cut since the ADAT input receiver raised it to 72 KB |
 | Flash-resident code (.text + .rodata + boot2, XIP) | ~98 KB |
-| Free RAM | ~99,460 B (per scripts/check_ram_placement.py, includes vector table + 2 KB heap reserve accounting) |
+| Free RAM | 103,964 B (per scripts/check_ram_placement.py, includes vector table + 2 KB heap reserve accounting) |
 | SPDIF producer pools (heap, 4 × 8 × 192 × 8) | ~48 KB |
 | Stack + remaining heap | drawn from the free-RAM pool above |
 
