@@ -588,7 +588,8 @@ static inline void dsp_svf_second_order_x2(Filter * __restrict f0, Filter * __re
     }
 
     if (arm0 == DSP_SVF_ARM_LPHP) {
-        // Low-pass takes v2 straight out; high-pass needs the 3-term mix.
+        // Low-pass takes v2 straight out; high-pass needs the 3-term mix
+        // with m0 = 1.0f and m2 = -1.0f folded in (v0 + m1*v1 - v2).
         // Split so neither section pays for the other's output expression.
         bool hp0 = (f0->filter_type == FILTER_HIGHPASS);
         bool hp1 = (f1->filter_type == FILTER_HIGHPASS);
