@@ -368,6 +368,31 @@ static bool i2s_prefilling = false;
 // prepare_pipeline_reset(). Driven by the main-loop ADAT block (RP2350).
 static bool adat_prefilling = false;
 
+// Input receiver exclusivity: at most one receiver may run, and only the one
+// the source in `keep` owns (INPUT_SOURCE_*, or 0xFF for none).  Stops every
+// other running receiver; each stop is a no-op when already inactive.  Paths
+// that set active_input_source without going through the deferred switch
+// handler (apply_factory_defaults) would otherwise strand a receiver on a
+// buffer the arena has handed to another input.
+static void stop_foreign_input_receivers(uint8_t keep) {
+    if (!input_source_is_spdif(keep) &&
+        spdif_input_get_state() != SPDIF_INPUT_INACTIVE) {
+        spdif_input_stop();
+        spdif_prefilling = false;
+    }
+    if (keep != INPUT_SOURCE_I2S &&
+        i2s_input_get_state() != I2S_INPUT_INACTIVE) {
+        i2s_input_stop();
+        i2s_prefilling = false;
+    }
+#if PICO_RP2350
+    if (keep != INPUT_SOURCE_ADAT && adat_input_is_running()) {
+        adat_input_stop();
+        adat_prefilling = false;
+    }
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // process_type_switches — unified output type transition handler
 //
@@ -2781,6 +2806,11 @@ int main(void) {
                 // type switch above already rebuilt everything).
                 rebuild_i2s_output_clocking();
 
+                // The load may have forced the source (empty/corrupt slot
+                // applies factory defaults, which writes active_input_source
+                // directly); drop any receiver that no longer owns it.
+                stop_foreign_input_receivers(active_input_source);
+
                 // Restart SPDIF RX once, after all type-switch / pipeline
                 // work is done.  Skipped if the preset switched the input
                 // source — input_source_change_pending will manage RX
@@ -3010,6 +3040,11 @@ int main(void) {
                 // type switch above already rebuilt everything).
                 rebuild_i2s_output_clocking();
 
+                // flash_factory_reset() forces the source back to USB without
+                // going through the deferred switch handler, so nothing above
+                // stopped a non-SPDIF/I2S receiver (ADAT); do it here.
+                stop_foreign_input_receivers(active_input_source);
+
                 // Restart SPDIF RX if we suspended it above (skip if an input-
                 // source change is pending — that handler manages RX).
                 if (suspended_spdif &&
@@ -3196,6 +3231,10 @@ int main(void) {
                 rebuild_i2s_output_clocking();
             }
 
+            // Same reconcile as the preset/factory paths: the payload may have
+            // changed the source underneath a running receiver.
+            stop_foreign_input_receivers(active_input_source);
+
             // Restart SPDIF RX if we suspended it above (outside the err==0
             // guard so a rejected payload still restores RX).  Skip if the
             // bulk payload queued an input-source change — that handler owns
@@ -3366,6 +3405,11 @@ int main(void) {
             }
         }
 
+        // Enforce receiver exclusivity once per iteration.  Legitimate
+        // stop/start pairs live inside a single iteration, so anything still
+        // running here against a different active source is a leak.
+        stop_foreign_input_receivers(active_input_source);
+
         // Handle deferred input source switch
         if (input_source_change_pending) {
             uint8_t new_source = pending_input_source;
@@ -3390,6 +3434,14 @@ int main(void) {
                 // the source teardown.  Gate held the DAC hardware mute;
                 // idempotent re-assert (hold not re-armed).
                 prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+
+                // Stop every receiver the new source does not own, by actual
+                // running state rather than by old_source: the enum chain
+                // below cannot see a receiver left running by a path that set
+                // active_input_source directly.  The per-branch stops that
+                // follow are then no-ops; the branches still own their rate /
+                // MCK / divider bookkeeping.
+                stop_foreign_input_receivers(new_source);
 
                 // Stop old source hardware.  A SPDIF-to-SPDIF input switch
                 // takes this stop branch and the is-spdif start branch below:

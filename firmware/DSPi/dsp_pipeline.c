@@ -3,6 +3,7 @@
 #include "dsp_pipeline.h"
 #include "dsp_svf.h"
 #include "dsp_biquad.h"
+#include "dsp_cascade.h"
 #include "dcp_inline.h"
 #include "crossover.h"
 
@@ -444,14 +445,46 @@ float dsp_process_channel(Filter * __restrict filters, float input, uint8_t chan
     return sample;
 }
 
-DSP_TIME_CRITICAL
-void dsp_process_channel_block(Filter * __restrict filters, float * __restrict samples,
-                               uint32_t count, uint8_t channel) {
-    uint8_t num_bands = channel_band_counts[channel];
+// A/B knob: 1 fuses shelf/Linkwitz SVF pairs (the generic arm), 0 leaves them
+// as singles.  Both settings are bit-identical; this only trades RAM text for
+// speed on the generic arm.
+#define DSPI_FUSE_GENERIC_SVF_PAIRS 1
 
-    for (int band = 0; band < num_bands; band++) {
-        Filter *f = &filters[band];
-        if (f->bypass) continue;
+DSP_TIME_CRITICAL
+void dsp_cascade_block(Filter * __restrict sections, uint32_t num_sections,
+                       float * __restrict samples, uint32_t count) {
+    uint32_t i = 0;
+
+    while (i < num_sections) {
+        Filter *f = &sections[i];
+        if (f->bypass) { i++; continue; }
+
+        // Bypassed sections are skipped without breaking the pair around them;
+        // section order is preserved exactly.
+        uint32_t j = i + 1;
+        while (j < num_sections && sections[j].bypass) j++;
+
+        // Second-order sections fuse only with a partner on the same path AND
+        // in the same kernel arm, so each keeps its specialized op count and
+        // still saves a load/store per sample.  A cross-arm pair would force
+        // the generic mix on a specialized section and cost more than it saves.
+        if (!f->first_order && j < num_sections) {
+            Filter *fn = &sections[j];
+            if (!fn->first_order && fn->use_svf == f->use_svf) {
+                if (!f->use_svf) {
+                    dsp_biquad_second_order_x2(f, fn, samples, count);
+                    i = j + 1;
+                    continue;
+                }
+                DspSvfArm arm = dsp_svf_arm_class(f);
+                if (arm == dsp_svf_arm_class(fn) &&
+                    (DSPI_FUSE_GENERIC_SVF_PAIRS || arm != DSP_SVF_ARM_GENERIC)) {
+                    dsp_svf_second_order_x2(f, fn, samples, count);
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
 
         if (f->use_svf) {
             if (f->first_order)
@@ -464,7 +497,14 @@ void dsp_process_channel_block(Filter * __restrict filters, float * __restrict s
             else
                 dsp_biquad_second_order(f, samples, count);
         }
+        i++;
     }
+}
+
+DSP_TIME_CRITICAL
+void dsp_process_channel_block(Filter * __restrict filters, float * __restrict samples,
+                               uint32_t count, uint8_t channel) {
+    dsp_cascade_block(filters, channel_band_counts[channel], samples, count);
 }
 #else
 // RP2040: Per-sample implemented in dsp_process_rp2040.S

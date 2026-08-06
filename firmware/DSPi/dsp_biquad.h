@@ -361,6 +361,225 @@ static inline void dsp_biquad_second_order(Filter * __restrict f, float * __rest
     f->s2 = s2;
 }
 
+// Second-order LP/HP sections satisfy b0 == b2 exactly; every second-order
+// crossover biquad section is one of these two types (crossover.c).
+static inline bool dsp_biquad_is_lphp(const Filter *f) {
+    return f->filter_type == FILTER_LOWPASS || f->filter_type == FILTER_HIGHPASS;
+}
+
+// Fused two-section cascade: each sample is loaded once, pushed through both
+// sections in registers, and stored once.  The arm is chosen once per call and
+// each arm reuses the matching single-kernel expressions verbatim, so a fused
+// sweep is bit-identical to two sequential single sweeps.
+static inline void dsp_biquad_second_order_x2(Filter * __restrict f0, Filter * __restrict f1,
+                                              float * __restrict samples, uint32_t count) {
+    float b0_0 = f0->b0, b1_0 = f0->b1, b2_0 = f0->b2;
+    float a1_0 = f0->a1, a2_0 = f0->a2;
+    float s1_0 = f0->s1, s2_0 = f0->s2;
+    float b0_1 = f1->b0, b1_1 = f1->b1, b2_1 = f1->b2;
+    float a1_1 = f1->a1, a2_1 = f1->a2;
+    float s1_1 = f1->s1, s2_1 = f1->s2;
+    float *sp = samples;
+    float x, y, z, t0, t1;
+    uint32_t blk_count = count >> 2; // unroll loops by 4
+
+    if (f0->filter_type == FILTER_PEAKING && f1->filter_type == FILTER_PEAKING) {
+        // Both sections optimise b1 = a1 (8 ops/section/sample vs 9 generic).
+        while(blk_count > 0) {
+            x = sp[0];
+            y = b0_0 * x + s1_0;
+            s1_0 = b1_0 * (x - y) + s2_0;
+            s2_0 = b2_0 * x - a2_0 * y;
+            z = b0_1 * y + s1_1;
+            s1_1 = b1_1 * (y - z) + s2_1;
+            s2_1 = b2_1 * y - a2_1 * z;
+            sp[0] = z;
+
+            x = sp[1];
+            y = b0_0 * x + s1_0;
+            s1_0 = b1_0 * (x - y) + s2_0;
+            s2_0 = b2_0 * x - a2_0 * y;
+            z = b0_1 * y + s1_1;
+            s1_1 = b1_1 * (y - z) + s2_1;
+            s2_1 = b2_1 * y - a2_1 * z;
+            sp[1] = z;
+
+            x = sp[2];
+            y = b0_0 * x + s1_0;
+            s1_0 = b1_0 * (x - y) + s2_0;
+            s2_0 = b2_0 * x - a2_0 * y;
+            z = b0_1 * y + s1_1;
+            s1_1 = b1_1 * (y - z) + s2_1;
+            s2_1 = b2_1 * y - a2_1 * z;
+            sp[2] = z;
+
+            x = sp[3];
+            y = b0_0 * x + s1_0;
+            s1_0 = b1_0 * (x - y) + s2_0;
+            s2_0 = b2_0 * x - a2_0 * y;
+            z = b0_1 * y + s1_1;
+            s1_1 = b1_1 * (y - z) + s2_1;
+            s2_1 = b2_1 * y - a2_1 * z;
+            sp[3] = z;
+
+            sp += 4;
+            blk_count--;
+        }
+
+        blk_count = count & 0x3;
+        while(blk_count > 0) {
+            x = *sp;
+            y = b0_0 * x + s1_0;
+            s1_0 = b1_0 * (x - y) + s2_0;
+            s2_0 = b2_0 * x - a2_0 * y;
+            z = b0_1 * y + s1_1;
+            s1_1 = b1_1 * (y - z) + s2_1;
+            s2_1 = b2_1 * y - a2_1 * z;
+            *sp++ = z;
+            blk_count--;
+        }
+
+        f0->s1 = s1_0;
+        f0->s2 = s2_0;
+        f1->s1 = s1_1;
+        f1->s2 = s2_1;
+        return;
+    }
+
+    if (dsp_biquad_is_lphp(f0) && dsp_biquad_is_lphp(f1)) {
+        // Both sections optimise b0 = b2, so the b0 product serves y and s2.
+        // Mixing LP with HP is fine: the identity holds per section.
+        while(blk_count > 0) {
+            x = sp[0];
+            t0 = b0_0 * x;
+            y = t0 + s1_0;
+            s1_0 = b1_0 * x - a1_0 * y + s2_0;
+            s2_0 = t0 - a2_0 * y;
+            t1 = b0_1 * y;
+            z = t1 + s1_1;
+            s1_1 = b1_1 * y - a1_1 * z + s2_1;
+            s2_1 = t1 - a2_1 * z;
+            sp[0] = z;
+
+            x = sp[1];
+            t0 = b0_0 * x;
+            y = t0 + s1_0;
+            s1_0 = b1_0 * x - a1_0 * y + s2_0;
+            s2_0 = t0 - a2_0 * y;
+            t1 = b0_1 * y;
+            z = t1 + s1_1;
+            s1_1 = b1_1 * y - a1_1 * z + s2_1;
+            s2_1 = t1 - a2_1 * z;
+            sp[1] = z;
+
+            x = sp[2];
+            t0 = b0_0 * x;
+            y = t0 + s1_0;
+            s1_0 = b1_0 * x - a1_0 * y + s2_0;
+            s2_0 = t0 - a2_0 * y;
+            t1 = b0_1 * y;
+            z = t1 + s1_1;
+            s1_1 = b1_1 * y - a1_1 * z + s2_1;
+            s2_1 = t1 - a2_1 * z;
+            sp[2] = z;
+
+            x = sp[3];
+            t0 = b0_0 * x;
+            y = t0 + s1_0;
+            s1_0 = b1_0 * x - a1_0 * y + s2_0;
+            s2_0 = t0 - a2_0 * y;
+            t1 = b0_1 * y;
+            z = t1 + s1_1;
+            s1_1 = b1_1 * y - a1_1 * z + s2_1;
+            s2_1 = t1 - a2_1 * z;
+            sp[3] = z;
+
+            sp += 4;
+            blk_count--;
+        }
+
+        blk_count = count & 0x3;
+        while(blk_count > 0) {
+            x = *sp;
+            t0 = b0_0 * x;
+            y = t0 + s1_0;
+            s1_0 = b1_0 * x - a1_0 * y + s2_0;
+            s2_0 = t0 - a2_0 * y;
+            t1 = b0_1 * y;
+            z = t1 + s1_1;
+            s1_1 = b1_1 * y - a1_1 * z + s2_1;
+            s2_1 = t1 - a2_1 * z;
+            *sp++ = z;
+            blk_count--;
+        }
+
+        f0->s1 = s1_0;
+        f0->s2 = s2_0;
+        f1->s1 = s1_1;
+        f1->s2 = s2_1;
+        return;
+    }
+
+    while(blk_count > 0) {
+        x = sp[0];
+        y = b0_0 * x + s1_0;
+        s1_0 = b1_0 * x - a1_0 * y + s2_0;
+        s2_0 = b2_0 * x - a2_0 * y;
+        z = b0_1 * y + s1_1;
+        s1_1 = b1_1 * y - a1_1 * z + s2_1;
+        s2_1 = b2_1 * y - a2_1 * z;
+        sp[0] = z;
+
+        x = sp[1];
+        y = b0_0 * x + s1_0;
+        s1_0 = b1_0 * x - a1_0 * y + s2_0;
+        s2_0 = b2_0 * x - a2_0 * y;
+        z = b0_1 * y + s1_1;
+        s1_1 = b1_1 * y - a1_1 * z + s2_1;
+        s2_1 = b2_1 * y - a2_1 * z;
+        sp[1] = z;
+
+        x = sp[2];
+        y = b0_0 * x + s1_0;
+        s1_0 = b1_0 * x - a1_0 * y + s2_0;
+        s2_0 = b2_0 * x - a2_0 * y;
+        z = b0_1 * y + s1_1;
+        s1_1 = b1_1 * y - a1_1 * z + s2_1;
+        s2_1 = b2_1 * y - a2_1 * z;
+        sp[2] = z;
+
+        x = sp[3];
+        y = b0_0 * x + s1_0;
+        s1_0 = b1_0 * x - a1_0 * y + s2_0;
+        s2_0 = b2_0 * x - a2_0 * y;
+        z = b0_1 * y + s1_1;
+        s1_1 = b1_1 * y - a1_1 * z + s2_1;
+        s2_1 = b2_1 * y - a2_1 * z;
+        sp[3] = z;
+
+        sp += 4;
+        blk_count--;
+    }
+
+    blk_count = count & 0x3;
+    while(blk_count > 0) {
+        x = *sp;
+        y = b0_0 * x + s1_0;
+        s1_0 = b1_0 * x - a1_0 * y + s2_0;
+        s2_0 = b2_0 * x - a2_0 * y;
+        z = b0_1 * y + s1_1;
+        s1_1 = b1_1 * y - a1_1 * z + s2_1;
+        s2_1 = b2_1 * y - a2_1 * z;
+        *sp++ = z;
+        blk_count--;
+    }
+
+    f0->s1 = s1_0;
+    f0->s2 = s2_0;
+    f1->s1 = s1_1;
+    f1->s2 = s2_1;
+}
+
 #endif // PICO_RP2350
 
 #endif // DSP_BIQUAD_H

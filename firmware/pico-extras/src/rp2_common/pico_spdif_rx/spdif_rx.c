@@ -17,6 +17,7 @@
 #include "spdif_rx_48000.pio.h"
 #include "spdif_rx_96000.pio.h"
 #include "spdif_rx_192000.pio.h"
+#include "input_capture_arena.h"  // DSPi patch: FIFO storage is shared
 
 // sample words to detect is equivalent to 64*4+8 symbols (2 frames + sync) at 44.1 KHz @ 125 MHz clock
 // because at least one Sync M Code has to be included in sampled words (-> need 2 frames considering when head block hits)
@@ -127,7 +128,13 @@ static spdif_rx_state_t state;
 static void (*on_stable_func)(spdif_rx_samp_freq_t samp_freq) = NULL;
 static void (*on_lost_stable_func)() = NULL;
 
-static uint32_t fifo_buff[SPDIF_RX_FIFO_SIZE];
+// DSPi patch: the FIFO lives in the shared input-capture arena, overlaid with
+// the I2S/ADAT capture rings (only one input receiver runs at a time).  The
+// DMA here is chained ping-pong, not an address-wrap ring, so 4-byte alignment
+// is all it needs.
+#define fifo_buff (input_capture_arena.spdif_fifo)
+_Static_assert(sizeof(input_capture_arena.spdif_fifo) == SPDIF_RX_FIFO_SIZE * 4,
+               "arena SPDIF member must match SPDIF_RX_FIFO_SIZE");
 static uint32_t buff_wr_pre_ptr = 0;
 static uint32_t buff_wr_done_ptr = 0;
 static uint32_t buff_rd_ptr = 0;
@@ -137,6 +144,10 @@ static dma_channel_config dma_config1;
 
 static bool setup_done = false;
 static bool stable_done = false;
+// DSPi patch: set before teardown cancels the alarm, so a callback that
+// already latched cannot re-claim DMA/PIO or schedule a successor behind
+// spdif_rx_end()'s back.  Cleared by spdif_rx_start().
+static volatile bool shutting_down = false;
 static bool irq_handler_registered = false;  // DSPi patch: track our own handler registration
 static spdif_rx_pio_program_t* current_pg;
 static int block_count;
@@ -458,6 +469,7 @@ static int64_t _spdif_rx_capture_timeout(alarm_id_t id, void* user_data)
     (void) id;
     (void) user_data;
 
+    if (shutting_down) return 0;  // DSPi patch: teardown in progress
     _clear_timer();
     _spdif_rx_common_end();  // internally interrupt-safe (save_and_disable_interrupts)
     _set_timer_after_by_ms(_spdif_rx_capture_retry, capture_retry_interval_ms);
@@ -469,6 +481,7 @@ static int64_t _spdif_rx_capture_retry(alarm_id_t id, void* user_data)
     (void) id;
     (void) user_data;
 
+    if (shutting_down) return 0;  // DSPi patch: teardown in progress
     _clear_timer();
     _spdif_rx_capture_start();
     _set_timer_after_by_us(_spdif_rx_capture_timeout, capture_timeout_us);
@@ -599,6 +612,7 @@ static int64_t _spdif_rx_decode_timeout(alarm_id_t id, void* user_data)
     (void) id;
     (void) user_data;
 
+    if (shutting_down) return 0;  // DSPi patch: teardown in progress
     state = SPDIF_RX_STATE_NO_SIGNAL;
     if ((gcfg.flags & SPDIF_RX_FLAG_CALLBACKS) && on_lost_stable_func != NULL) {
         (*on_lost_stable_func)();
@@ -714,6 +728,9 @@ void __isr __time_critical_func(spdif_rx_dma_irq_handler)()
     // Return immediately — do NOT clear timers or process state transitions,
     // as that would tear down an in-progress capture or corrupt decode timing.
     if (!proc_dma0 && !proc_dma1) return;
+    // DSPi patch: teardown in progress; our channels are acknowledged above,
+    // so returning here cannot storm the shared IRQ line.
+    if (shutting_down) return;
 
     _clear_timer(); // timeout must not happen while processing our DMA event
     uint64_t now_us = _micros();
@@ -790,6 +807,7 @@ void __isr __time_critical_func(spdif_rx_dma_irq_handler)()
 
 void spdif_rx_start(const spdif_rx_config_t* config)
 {
+    shutting_down = false;  // DSPi patch: re-arm the alarm callbacks
     state = SPDIF_RX_STATE_NO_SIGNAL;
     memmove(&gcfg, config, sizeof(spdif_rx_config_t)); // copy to gcfg
     _spdif_rx_capture_retry(-1, NULL); // at first, call capture retry timeout target directly
@@ -805,7 +823,15 @@ void spdif_rx_end()
     // callback either double-claims (panic) or double-cleans (panic) the
     // hardware resources.  Manifests as a crash on the first SPDIF→USB→SPDIF
     // cycle.
+    //
+    // The flag must be set BEFORE the cancel: an alarm that already latched
+    // fires inside this window, and only the flag can stop it re-arming
+    // capture (which would leave an uncancellable successor chained behind
+    // the teardown).
+    uint32_t save = save_and_disable_interrupts();
+    shutting_down = true;
     _clear_timer();
+    restore_interrupts(save);
 
     _spdif_rx_common_end();
     // DSPi patch: remove our shared handler and reset flag so it gets

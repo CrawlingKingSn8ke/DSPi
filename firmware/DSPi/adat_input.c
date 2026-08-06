@@ -34,6 +34,7 @@
 
 #include "audio_input.h"
 #include "audio_pipeline.h"
+#include "input_capture_arena.h"
 #include "config.h"
 #include "usb_audio.h"
 #include "input_servo.h"
@@ -88,8 +89,11 @@ _Static_assert(ADAT_RX_RING_WORDS % ADAT_RX_FRAME_WORDS == 0,
 // STATE
 // ============================================================================
 
-static uint32_t __attribute__((aligned(ADAT_RX_RING_WORDS * 4u)))
-    adat_rx_ring[ADAT_RX_RING_WORDS];
+// The ring lives in the shared input-capture arena (input_capture_arena.h);
+// the ADAT receiver only runs while ADAT is the active input source.
+#define adat_rx_ring (input_capture_arena.adat_ring)
+_Static_assert(sizeof(input_capture_arena.adat_ring) == ADAT_RX_RING_WORDS * 4u,
+               "arena ADAT member must match the ADAT ring size");
 
 static volatile AdatInputState adat_rx_state = ADAT_INPUT_INACTIVE;
 static bool     adat_rx_running = false;
@@ -444,6 +448,8 @@ void adat_input_start(void) {
         return;
     }
 
+    input_arena_claim(INPUT_ARENA_ADAT);
+
     pio_sm_claim(ADAT_RX_PIO, ADAT_RX_SM);
     adat_rx_prog_offset = pio_add_program(ADAT_RX_PIO, &adat_rx_program);
     dma_channel_claim(ADAT_RX_DMA_CH);
@@ -546,6 +552,7 @@ void adat_input_stop(void) {
     adat_rx_detected_rate = 0;
     meas_measured_hz = 0;
     adat_rx_set_state(ADAT_INPUT_INACTIVE);
+    input_arena_release(INPUT_ARENA_ADAT);
     printf("ADAT RX: stopped\n");
 }
 
@@ -720,6 +727,10 @@ uint32_t adat_input_current_tx_divider(void) {
 
 AdatInputState adat_input_get_state(void) {
     return adat_rx_state;
+}
+
+bool adat_input_is_running(void) {
+    return adat_rx_running;
 }
 
 uint32_t adat_input_get_detected_rate(void) {

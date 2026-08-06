@@ -13,6 +13,7 @@
 #include "spdif_input.h"
 #include "audio_input.h"
 #include "audio_pipeline.h"
+#include "input_capture_arena.h"
 #include "config.h"
 #include "dsp_pipeline.h"
 #include "usb_audio.h"
@@ -146,6 +147,9 @@ void spdif_input_start(void) {
     // Guard against double-start (would panic on resource re-claim)
     if (spdif_state != SPDIF_INPUT_INACTIVE) return;
 
+    // The library's FIFO is in the shared input-capture arena.
+    input_arena_claim(INPUT_ARENA_SPDIF);
+
     // PIO SM assignment:
     //   RP2040: PIO1 SM2 (SM0=PDM, SM1=MCK occupied)
     //   RP2350: PIO2 SM0 (dedicated PIO block)
@@ -209,6 +213,7 @@ void spdif_input_stop(void) {
         }
         spdif_state = SPDIF_INPUT_INACTIVE;
         spdif_rx_detected_rate = 0;
+        input_arena_release(INPUT_ARENA_SPDIF);
         printf("SPDIF RX: stopped\n");
     }
 }

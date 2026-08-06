@@ -86,6 +86,7 @@ DSPi is a USB Audio Class 1 (UAC1) digital signal processor built on the Raspber
 | `i2s_input.c` | I2S RX integration: master/slave PIO lifecycle, IRQ-less DMA ring, poll into pipeline |
 | `i2s_input.h` | I2S input API (start/stop/resync/poll), state enum |
 | `i2s_input.pio` | I2S RX PIO programs (clock-master and wait-driven slave variants) |
+| `input_capture_arena.h` | Shared capture-buffer union (SPDIF FIFO / I2S rings / ADAT ring) + ownership claim/release API |
 | `flash_storage.c` | Parameter save/load to last 4KB flash sector |
 | `flash_storage.h` | Flash storage API |
 | `bulk_params.c` | Bulk parameter collect/apply (wire format ↔ live state) |
@@ -445,7 +446,7 @@ Block-based two-phase architecture with dual-core EQ processing, all in Q28 fixe
 
 **Dual-core mode:** Core 0 handles input pipeline + matrix mix + SPDIF pair 1 (outputs 0-1), Core 1 handles SPDIF pair 2 (outputs 2-3) — both cores process per-output EQ, gain, delay, and S/PDIF conversion in parallel. PDM sub (output 4) runs on Core 1 in PDM mode; PDM and EQ worker outputs (2-3) are mutually exclusive.
 
-**Performance advantage of block-based processing:** Biquad coefficients are loaded once per biquad per block instead of once per sample. For a 2-band output channel with 192-sample blocks, this reduces coefficient loads from 384 to 2.
+**Performance advantage of block-based processing:** Biquad coefficients are loaded once per biquad per block instead of once per sample. For a 2-band output channel with 192-sample blocks, this reduces coefficient loads from 384 to 2. On RP2350 adjacent second-order biquad sections are additionally fused into one buffer sweep; see "Fused two-section cascade kernels" under Hybrid SVF/Biquad Filtering.
 
 ---
 
@@ -635,7 +636,7 @@ Single-precision throughout. Per-band SVF or TDF2 biquad path selected at coeffi
 Q28 fixed-point. Both per-sample and block-based biquad processing implemented in hand-optimized ARM assembly (`dsp_process_rp2040.S`). Block-based `dsp_process_channel_block()` keeps s1/s2 state in high registers across the entire sample loop, shares operand decompositions across multiply groups, and uses r12 for intermediate saves — eliminating per-sample struct access, function call overhead, and redundant decompositions vs the C `fast_mul_q28()` version.
 
 ### Hybrid SVF/Biquad Filtering (RP2350)
-*Last updated: 2026-07-12*
+*Last updated: 2026-08-05*
 
 The RP2350 uses a hybrid filter architecture that selects between a State Variable Filter (SVF) and a Transposed Direct Form II (TDF2) biquad on a per-band basis. This provides better numerical stability at low frequencies (where single-precision biquad pole quantization is worst) while retaining the efficiency of biquads at higher frequencies.
 
@@ -666,11 +667,30 @@ Where `g = tan(pi * freq / Fs)` and `A = 10^(gain_dB/40)`.
 
 **Linkwitz Transform SVF (added 2026-07-12):** The Linkwitz Transform (`FILTER_LINKWITZ_TRANSFORM`) is realized on the hybrid path as a full 2nd-order Simper SVF tuned at the **pole** pair: `g = tan(pi*fp/Fs)`, `k = 1/Qp`, with the output mix `m0 = 1`, `m1 = (g0/g)/Q0 - k`, `m2 = (g0/g)^2 - 1` (where `g0 = tan(pi*f0/Fs)` encodes the driver's measured corner). The SVF form is used only when **both** corners (`f0` and `fp`) sit below `Fs/7.5`; if either corner is at or above the boundary the band falls back to the exact-bilinear TDF2 biquad with both corners independently prewarped. This both-corners rule differs from the single-frequency test the other types use, because the transform's zero and pole must both be in the SVF-accurate region for the realizations to match.
 
+**Fused two-section cascade kernels (added 2026-08-05, extended to SVF pairs 2026-08-06, RP2350 only):** The block kernels used to be strictly band-major: every active band did its own read-modify-write sweep of the sample buffer, so an N-band cascade moved the block through memory N times. `dsp_cascade_block()` (`dsp_pipeline.c`, declared in `dsp_cascade.h`) now walks the cascade and, whenever the next two active sections are second-order and on the **same** path, runs them through one fused kernel: `dsp_biquad_second_order_x2()` (`dsp_biquad.h`) for biquad-path pairs, `dsp_svf_second_order_x2()` (`dsp_svf.h`) for SVF-path pairs. Each sample is loaded once, pushed through both sections while it stays in registers, and stored once, so a fused pair halves buffer traffic and loop administration versus two sweeps. Since 2026-08-05 the kernel also carries per-type specialized arms (see dispatch rules below), so a fused pair costs no more FP ops than the two single sweeps it replaces. Hardware A/B against a build with pairing disabled measures the specialized fused kernel at 19 % less EQ cost on peaking-heavy biquad cascades, 17 % on shelf-heavy ones, and 8 % on LR8 crossovers; against the earlier generic-only fused kernel it is 13 % better on peaking and 8 % on crossovers. Cost is ~1.2 KB of RAM text.
+
+**SVF pairs (added 2026-08-06).** An earlier fused SVF kernel that forced the generic three-term output mix on every pair was measured on hardware at +14 % on peaking-heavy cascades and removed: the extra FPU ops outweighed the saved memory traffic, because the single SVF kernel is switch-specialized per filter type. `dsp_svf_second_order_x2()` repeats the biquad kernel's fix instead: each arm reuses the matching single-kernel output expression, so no fused section ever pays for another type's mix, and the pair still collects the load/store saving. Hardware A/B at 48 kHz / 307.2 MHz over 17 channels measures the SVF band-sweep slope falling from 2.29 to 1.85 % CPU per band (-19 %); on 10-band cascades the EQ cost (net of the flat-pipeline floor) drops 17 % for peaking, 21 % for an 8-active/2-bypassed load, 8 % for shelves, and 9 % for an LR8 HP+LP crossover whose SVF high-pass sections now pair. Biquad-path rows and SVF/biquad alternations are unchanged, as expected. Cost is ~4.1 KB of RAM text for the specialized arms plus ~1.2 KB for the generic arm.
+
+The M33 FMA pipeline is throughput-bound, not latency-bound: interleaving two independent recurrences gains nothing, and loads/stores already overlap FPU work, so only reducing FP-op count pays on this core. That is why arm-for-arm op-count parity, not fusion itself, is the load-bearing property.
+
+Dispatch rules:
+- Section order is preserved exactly; bypassed sections are skipped and do not break the pair around them.
+- First-order sections and mixed biquad/SVF neighbours are never fused; they fall back to the existing single kernels. Two second-order sections fuse only when they share a path (`use_svf`) **and**, on the SVF path, the same kernel arm.
+- The fused biquad kernel picks one of three loop bodies **once per call**, never per sample: a peaking arm when both sections are `FILTER_PEAKING` (each section reuses the single kernel's `b1 = a1` form, 8 FP ops per section per sample), an LP/HP arm when both sections are `FILTER_LOWPASS` or `FILTER_HIGHPASS` in any combination (each reuses the `b0 = b2` form with the `b0*x` product computed once, also 8 ops), and the generic TDF2 form for everything else (9 ops). Because each arm's expressions match the corresponding single-kernel arm exactly, a fused sweep is bit-identical to two sequential single sweeps for those types, verified over 240 host cases covering every tail remainder and state carry-over. `FILTER_NOTCH` and `FILTER_ALLPASS` pairs (7 ops each) are deliberately **not** specialized: adjacent same-type notch or all-pass pairs are rare in practice and each extra arm costs ~580 bytes of RAM text against an already-exceeded `.data` budget.
+- The fused SVF kernel picks its loop body once per call from `dsp_svf_arm_class()` (`dsp_svf.h`), which buckets a section into one of three arms: `LPHP` (`FILTER_LOWPASS` / `FILTER_HIGHPASS`), `PEAK` (`FILTER_PEAKING` / `FILTER_NOTCH` / `FILTER_ALLPASS`, which share one arm in the single kernel), and `GENERIC` (shelves, Linkwitz Transform, anything else). Only equal-class neighbours pair, so each fused section keeps its single-kernel op count; the `LPHP` arm splits further into the four low/high-pass orderings because low-pass emits `v2` directly while high-pass needs the three-term mix. Bit-exactness against two sequential single sweeps is verified over 440 host cases covering every arm, all four `LPHP` orderings, every tail remainder, and state carry-over across calls. `DSPI_FUSE_GENERIC_SVF_PAIRS` in `dsp_pipeline.c` gates the generic arm; it is on because hardware measured shelf cascades 12 % cheaper with it than without.
+- The walker is shared: the crossover kernel (`xover_process_channel_block()`) calls the same `dsp_cascade_block()` per band, so crossover cascades pair on both paths: biquad sections above `Fs/7.5`, and SVF sections below it through the `LPHP` arm (every second-order crossover section carries `FILTER_LOWPASS` or `FILTER_HIGHPASS`). It is deliberately **out-of-line** so the unrolled kernel bodies are emitted into RAM once rather than duplicated into both callers; this made RP2350 `.text` and RAM image ~3.3 KB *smaller* than the pre-fusion band-major code.
+
+RP2040 is unaffected: its band-major assembly kernels (`dsp_process_rp2040.S`) and their dispatch are unchanged.
+
 **State reset:** When a band changes filter topology — crossing the SVF/biquad boundary (e.g. due to sample rate change) or switching between the one-pole and 2nd-order SVF (`bq->svf_first_order` flips) — both biquad state (`s1`, `s2`) and SVF state (`svic1eq`, `svic2eq`) are reset to zero to prevent transients.
 
 **Input validation:** Frequency clamped to [10 Hz, 0.45×Fs], Q clamped to [0.1, 20].
 
 **FPU configuration (RP2350):** Both cores set FPSCR flush-to-zero (FZ) and default-NaN (DN) bits at startup. This prevents denormalized floats from causing performance penalties as SVF integrator and biquad states decay toward zero after silence.
+
+**FP contraction (added 2026-08-05, RP2350 only):** `dsp_pipeline.c` is compiled with `-ffp-contract=off`, so the EQ kernels use separate VMUL/VADD instead of fused VFMA. Hardware measurement on the CPU meter established that the M33 FMA pipeline is throughput-bound with an effective VFMA occupancy of roughly 2 to 2.5 cycles versus 1 for VMUL/VADD: de-contraction emits ~58 % more FP instructions (and eliminates the VMOV accumulator copies VFMA's destructive form forces) yet measures 14 to 24 % less EQ cost on every kernel path, SVF and biquad alike, with no register spills. Loads/stores already overlap FPU issue, so FP-op *occupancy* is the only currency that matters in these loops. That is why the fused kernel only became worthwhile once its arms were specialized to match the single kernels' op counts (above): while it used the generic 9-op form it was giving back most of what the saved memory traffic won. Precision cost of double rounding is negligible and was verified on hardware: loopback THD, noise floor, and flat-path residual byte-identical to the contracted build, filter responses within 0.01 dB, and host analysis puts the noise penalty at ~1.5 dB on a −137 dB re-signal error floor. The flag is per-file: other DSP translation units (loudness, psybass, leveller, crossfeed, upmix) still contract and are candidates for the same measure-then-decide treatment.
+
+*Last updated: 2026-08-06*
 
 **Memory impact:** Biquad struct grows from ~48 to ~68 bytes on RP2350. With 110 EQ biquads at the larger size: ~3 KB additional BSS. (Loudness no longer uses the full `Biquad` struct; since 2026-07-09 its per-output shelf state is a separate minimal array, `loudness_output_state`, 144 B on RP2350 / 80 B on RP2040.)
 
@@ -723,7 +743,7 @@ PDM sub gets automatic alignment compensation: +SUB_ALIGN_SAMPLES (128 samples =
 ---
 
 ## Crossover Filters
-*Last updated: 2026-06-20*
+*Last updated: 2026-08-05*
 
 ### Purpose
 
@@ -762,7 +782,7 @@ Implemented as `xover_process_channel_block()` calls in:
 - `audio_pipeline.c` single-core and dual-core branches on both platforms (4 sites)
 - `pdm_generator.c` Core 1 EQ worker on both platforms (2 sites)
 
-Kernel reuses the existing per-section TDF2 (RP2040) and SVF/TDF2 (RP2350) inner loops. RP2040 calls a new assembly entry point `dsp_process_band_cascade_block` that shares the inner-loop body with `dsp_process_channel_block` via local labels — only the band-loop terminator differs (parameter-supplied `num_sections` vs `channel_band_counts[channel]` lookup).
+Kernel reuses the existing per-section TDF2 (RP2040) and SVF/TDF2 (RP2350) inner loops. RP2040 calls a new assembly entry point `dsp_process_band_cascade_block` that shares the inner-loop body with `dsp_process_channel_block` via local labels — only the band-loop terminator differs (parameter-supplied `num_sections` vs `channel_band_counts[channel]` lookup). Since 2026-08-05 the RP2350 side calls the shared `dsp_cascade_block()` per band, so a crossover cascade of second-order biquad-path sections pairs into fused two-section sweeps (SVF sections stay single; see "Fused two-section cascade kernels").
 
 ### State
 
@@ -1759,7 +1779,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## RP2040 vs RP2350 Comparison
-*Last updated: 2026-08-04 (Control Surfaces caps v7; loudness ref-SPL and intensity nouns on both platforms)*
+*Last updated: 2026-08-06 (input capture arena row; EQ cascade row: SVF pairs now fuse too)*
 
 ### Hardware
 
@@ -1802,6 +1822,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | USB input channels | 2 (stereo) | 2 / 4 / 6 / 8 |
 | I2S input channels | 2 (stereo) | 2 / 4 / 6 / 8 (configurable) |
 | ADAT input | Config state only (never selectable) | Yes (8 ch, 24-bit, 44.1/48 kHz; master/slave clock; PIO1 SM2 + DMA CH15) |
+| Input capture arena (shared SPDIF FIFO / I2S rings / ADAT ring) | 12,288 B, 4096-aligned (SPDIF FIFO is the largest member) | 32,768 B, 8192-aligned (the four I2S rings are the largest member) |
 | USB input bit depth | 16-bit or 24-bit (alt) | 16/24-bit (stereo) or 16-bit (multichannel) |
 | AS alt settings | 0, 1 (16-bit), 2 (24-bit) | 0, 1, 2, 3 (4ch), 4 (6ch), 5 (8ch) |
 | Wire / slot version | V28 / V35 | V28 / V35 |
@@ -1834,6 +1855,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | Parallel EQ | Core 0: input + 0-1, Core 1: 2-3 | Core 0: input + 0-1, Core 1: 2-7 |
 | Parallel crossover (V11+) | Same dispatch as PEQ — Core 1 owns its output range | Same dispatch as PEQ |
 | EQ worker data type | int32_t Q28, block-based | float, block-based, hybrid SVF/biquad |
+| EQ cascade structure | Band-major: one buffer sweep per band (assembly) | Paired: adjacent 2nd-order bands on the same path (biquad or SVF) fused into one sweep with per-type specialized arms (`dsp_cascade_block`) |
 | Crossover-stage availability when PDM enabled | Single-core (Core 0 only) | Single-core (Core 0 only) |
 
 ### DMA
@@ -1885,7 +1907,17 @@ masked, and PDM claims its channel once at init.
 ---
 
 ## Memory Layout
-*Last updated: 2026-07-19 (RP2350 stereo upmixer adds ~12.3 KB BSS: Haas + allpass rings sized for 48 kHz, estimators, double-buffered coeffs; RP2040 unchanged, feature compiled out)*
+*Last updated: 2026-08-06 (input capture arena overlays the SPDIF/I2S/ADAT capture buffers: -20,480 B BSS on RP2350, -4,092 B on RP2040; RP2350 .data +5,256 B for the fused SVF pair arms)*
+
+> **Input capture arena (2026-08-06).** The `pico_spdif_rx` FIFO (12 KB), the I2S
+> RX rings (4 KB RP2040 / 32 KB RP2350) and the ADAT RX ring (8 KB, RP2350 only)
+> are mutually exclusive and now overlay one BSS union, `input_capture_arena`
+> (`.bss.input_capture_arena`, first in the alignment-sorted `.bss` cluster).
+> Size is the largest member: **12,288 B on RP2040** (4096-aligned) and
+> **32,768 B on RP2350** (8192-aligned), reclaiming 4,092 B and 20,480 B of BSS
+> respectively. The explicit section keeps it out of COMMON, where its alignment
+> padding would eat most of the saving. Ownership is a runtime-checked invariant;
+> see "Input Capture Arena" under Audio Input Source System.
 
 > **Linkwitz Transform target-Q sidecar (2026-07-12).** The Linkwitz Transform's
 > fourth parameter (`Qp`) is stored out-of-band in a new BSS array
@@ -1920,9 +1952,10 @@ masked, and PDM claims its channel once at init.
 > control paths stay cold in flash. RP2040 compiles the engine out entirely
 > (zero cost). See "ADAT Bulk Output".
 
-> **ADAT bulk input (2026-07-13, acquisition state updated 2026-07-15; RP2350 only).** The ADAT receiver adds a fixed
-> **8 KB BSS ring** (`adat_rx_ring`, 2048 x uint32, aligned to its own size for the
-> DMA write-address wrap) plus a few dozen bytes of state (including the current
+> **ADAT bulk input (2026-07-13, acquisition state updated 2026-07-15; ring moved into the shared arena 2026-08-06; RP2350 only).** The ADAT receiver uses a fixed
+> **8 KB ring** (`adat_rx_ring`, 2048 x uint32, aligned to its own size for the
+> DMA write-address wrap; since 2026-08-06 it is a member of the shared
+> `input_capture_arena` and costs no BSS of its own) plus a few dozen bytes of state (including the current
 > slave probe rate and its 64-bit start timestamp), and roughly **3 KB of
 > RAM-pinned decode code**: the `DSP_TIME_CRITICAL` poll body, header check, frame
 > decoder, slave-mode rate machine, and clock servo. The bounded sync-search scan
@@ -2094,9 +2127,9 @@ and warns on flash reached through linker long-call veneers (cold paths); Check
 | Stereo upmixer state (Haas 2 × 1024 + allpass 2 × 512 floats + estimators + double-buffered coeffs) | ~12.3 KB |
 | Other BSS | ~35 KB |
 | **Total BSS** | **~346 KB** (measured 353,884 B after the stereo upmixer, + ~12.3 KB over the prior build. RP2040 unchanged: the feature is compiled out and the matrix is untouched) |
-| RAM code+rodata+data (.data section, hot set only) | 70,520 B (was 147,332 under copy_to_ram) |
+| RAM code+rodata+data (.data section, hot set only) | 84,360 B (was 147,332 under copy_to_ram; +5,256 B for the fused SVF pair arms, 2026-08-06). Over the 73,728 B `check_ram_placement.py` budget, which now fails by 10,632 B; the budget has not been re-cut since the ADAT input receiver raised it to 72 KB |
 | Flash-resident code (.text + .rodata + boot2, XIP) | ~98 KB |
-| Free RAM | ~99,460 B (per scripts/check_ram_placement.py, includes vector table + 2 KB heap reserve accounting) |
+| Free RAM | 103,964 B (per scripts/check_ram_placement.py, includes vector table + 2 KB heap reserve accounting) |
 | SPDIF producer pools (heap, 4 × 8 × 192 × 8) | ~48 KB |
 | Stack + remaining heap | drawn from the free-RAM pool above |
 
@@ -3125,7 +3158,7 @@ Master volume is re-derived on every preset *context* change (preset load, activ
 ---
 
 ## Audio Input Source System
-*Last updated: 2026-07-13 (ADAT input added as source 3, RP2350 only; see "ADAT Input")*
+*Last updated: 2026-08-06 (input capture arena + receiver exclusivity invariant; see "Input Capture Arena")*
 
 Abstraction layer enabling selection between multiple audio input sources. Supports USB (default), up to three SPDIF inputs, I2S, and (RP2350 only) an 8-channel ADAT lightpipe input.
 
@@ -3171,6 +3204,29 @@ Up to `SPDIF_RX_NUM_INPUTS` (4) SPDIF inputs share the single RX PIO state machi
 - When input is not USB, `usb_audio_drain_ring()` is skipped — USB enumeration stays active but audio data is silently dropped
 - SPDIF RX hardware only runs when SPDIF is the selected input source; I2S RX hardware only runs when I2S is the selected input source. The two share the same PIO SM and DMA channels, which is safe because inputs are switched, never mixed. The four SPDIF inputs likewise share the single RX SM/DMA pair; switching between them runs the same full stop/restart so only the active input's GPIO is ever claimed
 - Switching to I2S applies the selected `i2s_input_rate` (via `perform_rate_change()` when it differs from the current rate), then runs the same drain/prefill-to-50%/enable-in-sync handshake as SPDIF (minus the lock wait, since the synchronous input runs as soon as it is started). See the I2S Input prefill note below
+
+### Input Capture Arena
+*Last updated: 2026-08-06 (new: the three capture buffers overlay one arena; receiver exclusivity is now a checked invariant)*
+
+The three input receivers never run at the same time, so their capture buffers share one BSS arena (`firmware/DSPi/input_capture_arena.h`, defined in `audio_input.c`):
+
+| Member | Owner | RP2040 | RP2350 |
+|--------|-------|--------|--------|
+| `spdif_fifo` | `pico_spdif_rx`'s `fifo_buff` | 12,288 B | 12,288 B |
+| `i2s_ring` | `i2s_input.c`'s `i2s_rx_ring` | 4,096 B (1 pair) | 32,768 B (4 pairs) |
+| `adat_ring` | `adat_input.c`'s `adat_rx_ring` | n/a | 8,192 B |
+| **Arena** | union, aligned to the largest member's DMA wrap | **12,288 B / 4096-aligned** | **32,768 B / 8192-aligned** |
+
+This reclaims 4,092 B of BSS on RP2040 and 20,480 B on RP2350. Each module aliases its old symbol name onto its member with a macro, so all other references are unchanged, and each static-asserts its own ring constants against the arena geometry. The arena's alignment equals one I2S row, which is what keeps every row inside its own DMA write-address wrap region; the ADAT ring wraps on the whole 8 KB member. The SPDIF FIFO is chained ping-pong DMA (no address wrap) and needs only 4-byte alignment. Buffers deliberately **not** in the arena: `adat_ring` (ADAT *output*, runs with any input), the consumer pools, `pdm_dma_buffer`, and the USB `audio_ring`.
+
+**Ownership invariant.** At most one receiver runs, and only the one the active source owns. `input_arena_claim()` panics if the arena is already held by a different owner; each `*_input_start()` claims (USB claims nothing) and each `*_input_stop()` releases. Two enforcement points keep the invariant true rather than merely asserted:
+
+- `stop_foreign_input_receivers(keep)` (main.c) stops every receiver that is *actually running* but is not `keep`, keyed on running state rather than on the old source enum. It runs once per main-loop iteration, at the top of the deferred source switch (with the incoming source as `keep`, making the per-branch stops no-ops), and at the restart points of preset load, factory reset and bulk apply.
+- Those three paths matter because `apply_factory_defaults()` writes `active_input_source = INPUT_SOURCE_USB` directly, bypassing the deferred switch handler; before this, a factory reset / empty-slot preset load / active-slot preset delete while ADAT was live left the ADAT receiver running (ENDLESS DMA into its ring) with no path that would ever stop it, since the switch handler's stop chain keys on the old source. SPDIF and I2S were already interlocked by their shared DMA channels and PIO SM; ADAT has its own (DMA 15, PIO1 SM2), so only convention protected it.
+
+The flash-blackout behavior is unchanged: ADAT may keep running through a blackout while it *remains* the active source (see "ADAT Input", flash-write bracket).
+
+**SPDIF teardown alarm race.** `spdif_rx_end()` now sets a `shutting_down` flag before cancelling the pending alarm (both under `save_and_disable_interrupts()`), and every alarm callback plus the DMA IRQ handler returns immediately when it is set; `spdif_rx_start()` clears it. An alarm that had already latched could otherwise fire inside the teardown window, re-run `_spdif_rx_capture_start()` (re-claiming DMA and re-arming a write into the shared FIFO) and schedule a successor the teardown never cancels, chaining a retry every 100 ms behind a stopped receiver.
 
 ### USB Behavior While Non-USB Input is Active (2026-05-04)
 
@@ -3379,7 +3435,7 @@ The helper `i2s_effective_bck_pin()` resolves the pair the active clock mode act
 
 **Flash-write bracket.** `prepare_flash_write_operation()` treats a LOCKED ADAT input as a live source: it appears in the pre-mute drain, the streaming test, and the fade-settle loop (which calls `adat_input_poll()` until both the settle interval and the DAC hardware-mute hold have elapsed), matching the guarantees given to USB/SPDIF/I2S (see "DAC Hardware Mute"). Unlike SPDIF and I2S, ADAT is deliberately NOT stopped for the ~45 ms blackout: its RX is an IRQ-less free-running DMA ring with no decode-timeout alarms to race the blackout edge, and the poll re-acquires frame sync after the ring laps; `preset_loading` (still set from `prepare_pipeline_reset()`) then re-runs the drain/prefill/enable handshake once LOCKED returns.
 
-**Resources.** PIO1 SM2 (PIO1 SM0 = PDM, SM1 = ADAT TX); DMA channel 15 (RX ring, ENDLESS mode, no IRQ). The 8 KB `adat_rx_ring` is fixed BSS; the decode hot path (`adat_input_poll`, `adat_rx_header_ok`, `adat_rx_decode_frame`, `adat_rx_rate_machine`, `adat_input_update_clock_servo`) is `DSP_TIME_CRITICAL` and RAM-resident (the acquisition probe/header scan stays cold in flash, since it runs only while muted). See "Memory Layout".
+**Resources.** PIO1 SM2 (PIO1 SM0 = PDM, SM1 = ADAT TX); DMA channel 15 (RX ring, ENDLESS mode, no IRQ). The 8 KB `adat_rx_ring` lives in the shared `input_capture_arena` (see "Input Capture Arena"); the decode hot path (`adat_input_poll`, `adat_rx_header_ok`, `adat_rx_decode_frame`, `adat_rx_rate_machine`, `adat_input_update_clock_servo`) is `DSP_TIME_CRITICAL` and RAM-resident (the acquisition probe/header scan stays cold in flash, since it runs only while muted). See "Memory Layout".
 
 **Persistence.** ADAT input config persists like the optional SPDIF inputs (disabled by default, pin `0xFF` = unset, GPIO claimed only while ADAT is the active source). `WireInputConfig` (V24) gains `adat_input_pin`, `adat_input_enabled_p1` (enable + 1; 0 absent), and `adat_clock_mode_p1` (mode + 1; 0 absent, 1 master, 2 slave). The fields also ride `PresetSlot` (`SLOT_DATA_VERSION` 32) and the device-global `FlashOutputConfig` (`DIR_VERSION` 15), honoring `output_config_mode` exactly like the other physical-IO config. Vendor commands: `REQ_SET/GET_ADAT_INPUT_ENABLE` (0x68/0x69), `REQ_SET/GET_ADAT_INPUT_PIN` (0x6A/0x6B), `REQ_SET/GET_ADAT_INPUT_CLOCK_MODE` (0x6C/0x6D), `REQ_GET_ADAT_INPUT_STATUS` (0x6E); 0x6F reserved.
 

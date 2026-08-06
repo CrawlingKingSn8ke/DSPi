@@ -46,6 +46,7 @@
 #include "i2s_input.h"
 #include "audio_input.h"
 #include "audio_pipeline.h"
+#include "input_capture_arena.h"
 #include "config.h"
 #include "dsp_pipeline.h"
 #include "usb_audio.h"
@@ -114,10 +115,18 @@ _Static_assert(I2S_RX_DMA_BASE + 2 * I2S_RX_MAX_PAIRS <= NUM_DMA_CHANNELS,
 // absorbs the resulting sub-buffer fill ripple.
 #define I2S_INPUT_MIN_BLOCK 48u
 
-// Per-pair ring storage.  Each row is aligned to its own byte size so the DMA
-// write-address wrap (channel_config_set_ring) stays within the pair's ring.
-static uint32_t __attribute__((aligned(I2S_RX_RING_BYTES)))
-    i2s_rx_ring[I2S_RX_MAX_PAIRS][I2S_RX_RING_WORDS];
+// Per-pair ring storage in the shared input-capture arena
+// (input_capture_arena.h).  Each row is aligned to its own byte size so the DMA
+// write-address wrap (channel_config_set_ring) stays within the pair's ring;
+// the arena's alignment equals the row size, which is what preserves that.
+#define i2s_rx_ring (input_capture_arena.i2s_ring)
+_Static_assert(sizeof(input_capture_arena.i2s_ring) ==
+                   I2S_RX_MAX_PAIRS * I2S_RX_RING_BYTES,
+               "arena I2S member must match the I2S ring array size");
+_Static_assert(sizeof(input_capture_arena.i2s_ring[0]) == I2S_RX_RING_BYTES,
+               "arena I2S row must match the per-pair ring size");
+_Static_assert(INPUT_ARENA_ALIGN >= I2S_RX_RING_BYTES,
+               "arena alignment must cover the per-pair ring wrap");
 
 // ============================================================================
 // PER-PAIR STATE
@@ -340,6 +349,8 @@ void i2s_input_start(bool clock_master) {
     // Guard against double-start (would panic on resource re-claim).
     if (i2s_state != I2S_INPUT_INACTIVE) return;
 
+    input_arena_claim(INPUT_ARENA_I2S);
+
     // External-clock slave role overrides the master election: an external
     // device owns BCK/LRCLK, so the input SM never generates clocks (the
     // caller already passes clock_master == false; this is defensive).
@@ -552,6 +563,7 @@ void i2s_input_stop(void) {
     if (i2s_role_extclk) i2s_slave_disarm();
 
     i2s_state = I2S_INPUT_INACTIVE;
+    input_arena_release(INPUT_ARENA_I2S);
     printf("I2S RX: stopped\n");
 }
 
