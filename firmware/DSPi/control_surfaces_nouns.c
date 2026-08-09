@@ -24,6 +24,7 @@
 #include "lg_sound_sync.h"
 #include "siggen.h"
 #include "crossover.h"
+#include "audio_pipeline.h"
 #include "dsp_pipeline.h"
 #include "psybass.h"
 #include "upmix.h"
@@ -230,6 +231,9 @@ const CsNounDesc cs_noun_table[CS_NOUN_COUNT] = {
     [CS_NOUN_LOUDNESS_INTENSITY] = { CS_KIND_CONTINUOUS, 0, CS_CONT_RW,
                                   Q8(LOUDNESS_INTENSITY_MIN), Q8(CS_LOUDNESS_INTENSITY_MAX),
                                   CS_UNIT_PERCENT, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_INPUT_LEVEL_MAX] = { CS_KIND_CONTINUOUS, 0, CS_CONT_RO,
+                                  Q8(-60), 0, CS_UNIT_DB,
+                                  CS_TARGET_NONE, 0, 0 },
 };
 
 // ---------------------------------------------------------------------------
@@ -321,6 +325,21 @@ float cs_noun_get(uint8_t noun, uint8_t target, uint8_t index) {
             return (global_status.clip_flags & (1u << target)) ? 1.0f : 0.0f;
         case CS_NOUN_LEVEL: {
             uint16_t pk = global_status.peaks[target];
+            if (pk == 0) return -60.0f;
+            float db = 20.0f * log10f((float)pk * (1.0f / 32767.0f));
+            return (db < -60.0f) ? -60.0f : db;
+        }
+        case CS_NOUN_INPUT_LEVEL_MAX: {
+            // peaks[] freezes at its last value when block delivery stops
+            // (nothing clears it), so a dead source must read as silence or
+            // an amp-trigger LED would latch on forever.
+            if (!pipeline_producer_is_streaming()) return -60.0f;
+            // Inputs occupy peaks[0..n); inactive channels read 0, so the
+            // max over the active count is the live signal-presence level.
+            uint16_t pk = 0;
+            uint8_t n = active_input_channel_count();
+            for (uint8_t ch = 0; ch < n; ch++)
+                if (global_status.peaks[ch] > pk) pk = global_status.peaks[ch];
             if (pk == 0) return -60.0f;
             float db = 20.0f * log10f((float)pk * (1.0f / 32767.0f));
             return (db < -60.0f) ? -60.0f : db;

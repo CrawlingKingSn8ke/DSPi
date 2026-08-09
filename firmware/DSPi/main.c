@@ -909,8 +909,9 @@ static void pipeline_fade_reset(void) {
 
 // True while something is actually feeding process_input_block(); mirrors the
 // producer set the main loop services (and the generator's idle pump, which
-// is what fills the pools when no source is streaming).
-static bool pipeline_producer_is_streaming(void) {
+// is what fills the pools when no source is streaming).  Public: the CS
+// INPUT_LEVEL_MAX noun gates on it (peaks[] freezes when blocks stop).
+bool pipeline_producer_is_streaming(void) {
     extern volatile bool sync_started;
     if (active_input_source == INPUT_SOURCE_USB && sync_started) return true;
     if (input_source_is_spdif(active_input_source) &&

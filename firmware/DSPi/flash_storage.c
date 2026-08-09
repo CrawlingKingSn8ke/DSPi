@@ -2209,7 +2209,7 @@ static void cs_config_from_v1(CsFlashConfig *dst, const CsFlashConfig_v1 *src) {
         n->step      = o->step;
         n->range_min = o->range_min;
         n->range_max = o->range_max;
-        // event / target / index / reserved / reserved2 stay zero.
+        // event / target / index / reserved / delays / reserved2 stay zero.
     }
     // slots 8..15 stay zero (CS_TYPE_NONE) from the memset.
 }

@@ -115,7 +115,7 @@ volatile bool    cs_revert_pending = false;
 // ---------------------------------------------------------------------------
 
 static const CsCapsHeader s_caps = {
-    .caps_version = 7,
+    .caps_version = 8,
     .max_bindings = CS_MAX_BINDINGS,
     .type_count   = CS_TYPE_COUNT,
     .noun_count   = CS_NOUN_COUNT,
@@ -183,6 +183,9 @@ typedef struct {
     int32_t  pot_sent_q;    // quantized units at last dispatch
     // LEDs
     uint8_t  led_lit;       // CS_LEVEL_UNKNOWN forces the first write
+    uint8_t  led_raw;       // last raw indicator condition (delay filter input)
+    uint8_t  led_cond;      // delay-filtered condition the pin follows
+    uint32_t led_edge_ms;   // wall-clock ms at the last raw-condition change
     uint16_t pwm_level;     // last written PWM compare level
     CsOpState op;
 } CsRuntime;
@@ -697,16 +700,35 @@ static void cs_tick_pot(uint8_t slot) {
     }
 }
 
+// TON/TOF filter for indicator conditions: the raw condition must hold for
+// on_delay/off_delay (0.1 s units) before the output follows it.  Wall-clock
+// so a slow loop cannot stretch minute-scale delays; the unsigned subtraction
+// absorbs the ~49.7-day uint32 ms wrap.
+static uint8_t cs_ind_delay(const CsBinding *b, CsRuntime *rt, uint8_t raw) {
+    uint32_t now_ms = (uint32_t)(s_last_tick_us / 1000u);
+    if (raw != rt->led_raw) {
+        rt->led_raw = raw;
+        rt->led_edge_ms = now_ms;
+    }
+    if (raw != rt->led_cond) {
+        uint32_t delay_ms = (uint32_t)(raw ? b->on_delay : b->off_delay) * 100u;
+        if (now_ms - rt->led_edge_ms >= delay_ms)
+            rt->led_cond = raw;
+    }
+    return rt->led_cond;
+}
+
 static void cs_tick_led(uint8_t slot) {
     const CsBinding *b = &s_cfg.bindings[slot];
     const CsNounDesc *nd = &cs_noun_table[b->noun];
     CsRuntime *rt = &s_rt[slot];
     float v = cs_noun_get(b->noun, b->target, b->index);
-    uint8_t lit;
+    uint8_t raw;
     if (b->action == CS_ACT_IND_ABOVE)
-        lit = (v >= cs_decode(nd->unit, b->value)) ? 1 : 0;
+        raw = (v >= cs_decode(nd->unit, b->value)) ? 1 : 0;
     else
-        lit = ((int)v == (int)b->value) ? 1 : 0;
+        raw = ((int)v == (int)b->value) ? 1 : 0;
+    uint8_t lit = cs_ind_delay(b, rt, raw);
     if (lit == rt->led_lit) return;
     rt->led_lit = lit;
     gpio_put(b->gpio[0], (b->flags & CS_FLAG_INVERT) ? !lit : lit);
@@ -731,10 +753,10 @@ static void cs_tick_led_pwm(uint8_t slot) {
         // Square the normalized position; a perceptually even sweep.
         level = (uint16_t)(norm * norm * (float)CS_PWM_WRAP);
     } else {
-        uint8_t lit = (b->action == CS_ACT_IND_ABOVE)
+        uint8_t raw = (b->action == CS_ACT_IND_ABOVE)
                     ? (v >= cs_decode(nd->unit, b->value) ? 1 : 0)
                     : ((int)v == (int)b->value ? 1 : 0);
-        level = lit ? CS_PWM_WRAP : 0;
+        level = cs_ind_delay(b, rt, raw) ? CS_PWM_WRAP : 0;
     }
     if (b->flags & CS_FLAG_INVERT) level = CS_PWM_WRAP - level;
     if (level == rt->pwm_level) return;
@@ -957,6 +979,13 @@ static uint8_t cs_validate(const CsBinding *b, uint8_t slot) {
     if (b->reserved != 0) return CS_STATUS_INVALID_VALUE;
     for (int i = 0; i < (int)sizeof(b->reserved2); i++)
         if (b->reserved2[i] != 0) return CS_STATUS_INVALID_VALUE;
+
+    // Delays filter a boolean indicator condition; everything else (inputs,
+    // IND_LEVEL, the IR container) must carry 0.
+    if ((b->on_delay != 0 || b->off_delay != 0) &&
+        !((b->type == CS_TYPE_LED || b->type == CS_TYPE_LED_PWM) &&
+          (b->action == CS_ACT_IND_EQUALS || b->action == CS_ACT_IND_ABOVE)))
+        return CS_STATUS_INVALID_VALUE;
 
     const CsTypeDesc *td = &s_caps.types[b->type];
     const CsNounDesc *nd = &cs_noun_table[b->noun];

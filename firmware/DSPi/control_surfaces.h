@@ -53,6 +53,11 @@
  * Caps v7 adds the loudness reference-SPL and intensity nouns.  No structure
  * sizes change; hosts pick them up from noun_count as usual.
  *
+ * Caps v8 adds indicator timing (CsBinding on_delay/off_delay, 0.1 s units,
+ * carved from reserved2; LED types with IND_EQUALS/IND_ABOVE only) and the
+ * INPUT_LEVEL_MAX noun (loudest channel of the active input).  Struct sizes
+ * are unchanged; pre-v8 configs carry zeros there, meaning no delay.
+ *
  * See Documentation/Features/control_surfaces_spec.md.
  */
 
@@ -138,6 +143,9 @@ typedef enum {
     // --- caps v7 additions ---
     CS_NOUN_LOUDNESS_SPL   = 49, // continuous dB SPL 40..100 (reference listening level)
     CS_NOUN_LOUDNESS_INTENSITY = 50, // continuous percent 0..127 (compensation depth)
+    // --- caps v8 additions ---
+    CS_NOUN_INPUT_LEVEL_MAX = 51, // continuous dB, read-only; loudest channel of
+                                  // the active input (signal-presence sensing)
     CS_NOUN_COUNT
 } CsNoun;
 
@@ -272,7 +280,12 @@ typedef struct __attribute__((packed)) {
     int16_t step;          // STEP/INC/DEC size; 0 = per-unit default
     int16_t range_min;     // pot/IND_LEVEL span; both 0 = the noun's full range
     int16_t range_max;
-    uint8_t reserved2[6];  // write 0
+    // Indicator condition timing (caps v8): the raw IND_EQUALS/IND_ABOVE
+    // condition must hold continuously this long before the LED follows it
+    // (PLC TON/TOF).  0.1 s units, 0 = immediate; LED types only.
+    uint16_t on_delay;
+    uint16_t off_delay;
+    uint8_t reserved2[2];  // write 0
 } CsBinding;
 
 // One IR remote command; 16 bytes, identical on the wire (REQ_SET/GET_CS_IR_CMD
@@ -323,7 +336,7 @@ typedef struct __attribute__((packed)) {
 } CsTypeDesc;
 
 typedef struct __attribute__((packed)) {
-    uint8_t  caps_version; // capability format version (7); see the file
+    uint8_t  caps_version; // capability format version (8); see the file
                            // header for what each version added
     uint8_t  max_bindings; // CS_MAX_BINDINGS
     uint8_t  type_count;   // CS_TYPE_COUNT (table follows, index = CsType)

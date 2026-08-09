@@ -18,7 +18,7 @@ Format v2 supersedes the v1 (16-byte binding, 8 slots, 9 nouns) format
 described by earlier revisions of this document; see section 11 for the
 compatibility story.
 
-Caps v3 adds two things on top of v2 (section 11.5):
+Caps v3 adds two things on top of v2 (section 11.6):
 
 - **The IR remote component** (`CS_TYPE_IR`): one binding slot holds a
   demodulating IR receiver on one GPIO, and up to 8 learned remote-button
@@ -31,7 +31,7 @@ Caps v3 adds two things on top of v2 (section 11.5):
   flash write and `REQ_CS_REVERT` reloads the stored one. Section 3.5.
 
 Caps v4 adds 14 nouns and one unit on top of v3, with no structure or
-stored-config changes (section 11.4): the stereo upmixer (35-40, RP2350
+stored-config changes (section 11.5): the stereo upmixer (35-40, RP2350
 only), psychoacoustic bass (41-46), per-output delay (47, using the new
 `CS_UNIT_MS`), and a preset-reload trigger (48).
 
@@ -41,6 +41,14 @@ format v2, `CsStatusPacket` 41 bytes); hosts must size the list from
 
 Caps v7 appends the two remaining loudness parameters as nouns 49-50
 (reference SPL and intensity), with no structure or stored-config changes.
+
+Caps v8 adds indicator condition timing: `CsBinding` gains `on_delay` and
+`off_delay` (uint16, 0.1 s units, carved from the former `reserved2[6]`;
+struct still 24 bytes), legal only on LED types with `IND_EQUALS`/`IND_ABOVE`
+(sections 2.2 and 6.5). It also appends noun 51, `INPUT_LEVEL_MAX` (read-only
+dB, the loudest channel of the active input), for signal-presence sensing
+such as amplifier trigger outputs. Pre-v8 configs carry zeros in the new
+fields, which means no delay; nothing else changes.
 
 Writing style note: this doc avoids em-dashes per project convention.
 
@@ -194,8 +202,8 @@ giving smooth, jitter-free knob behavior without flooding the dispatcher.
 
 | Off | Size | Field | Meaning |
 |----|------|-------|---------|
-| 0 | 1 | `type` | `CsType` (0-6); `0` = slot cleared |
-| 1 | 1 | `noun` | `CsNoun` (0-48) |
+| 0 | 1 | `type` | `CsType` (0-7); `0` = slot cleared |
+| 1 | 1 | `noun` | `CsNoun` (0-51) |
 | 2 | 1 | `action` | `CsAction` (0-11) |
 | 3 | 1 | `flags` | `CS_FLAG_*` bitfield (see 2.2.1); unknown bits are rejected with `CS_STATUS_INVALID_VALUE` |
 | 4 | 1 | `gpio[0]` | primary GPIO |
@@ -208,7 +216,9 @@ giving smooth, jitter-free knob behavior without flooding the dispatcher.
 | 12 | 2 | `step` (int16) | `STEP`/`INC`/`DEC` size; `0` = the unit default (2.1) |
 | 14 | 2 | `range_min` (int16) | pot / `IND_LEVEL` span low end; both range fields `0` = the noun's full range |
 | 16 | 2 | `range_max` (int16) | pot / `IND_LEVEL` span high end |
-| 18 | 6 | `reserved2[6]` | write 0 (rejected non-zero) |
+| 18 | 2 | `on_delay` (uint16) | caps v8: raw condition must hold true this long before the LED turns on; 0.1 s units, 0 = immediate. LED types with `IND_EQUALS`/`IND_ABOVE` only; rejected non-zero elsewhere |
+| 20 | 2 | `off_delay` (uint16) | caps v8: raw condition must hold false this long before the LED turns off; same rules |
+| 22 | 2 | `reserved2[2]` | write 0 (rejected non-zero) |
 
 #### 2.2.1 Flags
 
@@ -249,10 +259,10 @@ the firmware stores and what `REQ_GET_ALL_PARAMS` does **not** contain.
 
 | Off | Size | Field | Meaning |
 |----|------|-------|---------|
-| 0 | 1 | `caps_version` | capability format version (7) |
+| 0 | 1 | `caps_version` | capability format version (8) |
 | 1 | 1 | `max_bindings` | `CS_MAX_BINDINGS` (16) |
 | 2 | 1 | `type_count` | `CS_TYPE_COUNT` (8); the type table has this many entries, indexed by `CsType` |
-| 3 | 1 | `noun_count` | `CS_NOUN_COUNT` (51) |
+| 3 | 1 | `noun_count` | `CS_NOUN_COUNT` (52) |
 | 4 | 32 | `types[8]` | eight `CsTypeDesc`, one per `CsType` including index 0 (`NONE`, all-zero) |
 | 36 | 1 | `max_ir_commands` | `CS_MAX_IR_COMMANDS` (16) |
 | 37 | 3 | `reserved[3]` | 0 |
@@ -268,7 +278,7 @@ carries `noun = action = 0` (section 2.7).
 
 ### 2.5 `CsNounDesc` (12 bytes)
 
-Returned by `REQ_GET_CS_CAPS` with `wValue = noun index` (0-48).
+Returned by `REQ_GET_CS_CAPS` with `wValue = noun index` (0-51).
 
 | Off | Size | Field | Meaning |
 |----|------|-------|---------|
@@ -578,7 +588,7 @@ pins -> PWM slice.
 - `REQ_GET_CS_CAPS`, `wValue = 0xFFFF` -> 40-byte `CsCapsHeader`: version, limits,
   the 8-entry type table (indexed by `CsType`), and the v3 tail
   (`max_ir_commands`).
-- `REQ_GET_CS_CAPS`, `wValue = 0..34` (a noun index) -> 12-byte `CsNounDesc` for
+- `REQ_GET_CS_CAPS`, `wValue = 0..51` (a noun index) -> 12-byte `CsNounDesc` for
   that noun. An out-of-range noun STALLs (USB) / returns ERROR (UART/I2C).
 - A noun whose `actions == 0` is unavailable on this platform (currently only
   `ADAT_ACTIVE` on RP2040); grey it out.
@@ -673,6 +683,7 @@ Action-mask groups used below:
 | `PRESET_RELOAD` | 48 | BOOL | - | - | - | `TRIGGER` (`0x0080`) |
 | `LOUDNESS_SPL` | 49 | CONT | DB | 40..100 dB SPL | - | CONT-RW |
 | `LOUDNESS_INTENSITY` | 50 | CONT | PERCENT | 0..127 % | - | CONT-RW |
+| `INPUT_LEVEL_MAX` | 51 | CONT | DB | -60..0 dB | - | CONT-RO |
 
 The *effective* legal action set for a (type, noun) pair is the bitwise AND of
 its two masks. Example: an encoder (`STEP` only) on `USER_MUTE` (bool, no
@@ -737,6 +748,7 @@ target and dispatches it.
 | `DAC_MUTE_TEST` | `REQ_TEST_DAC_HW_MUTE` (`0xEC`, GET) | `TRIGGER` pulses the DAC hardware mute for ~1 s so an installer can verify pin and polarity by ear. |
 | `CLIP_CH` | (read-only) | Per-channel clip latch bit (`target` = DSP channel). Clearing is global via the `CLIP` noun. |
 | `LEVEL` | (read-only) | Per-channel peak meter in dB (-60..0), `target` = DSP channel. Drives `IND_ABOVE` (signal-present LED) and `IND_LEVEL` (PWM meter LED). |
+| `INPUT_LEVEL_MAX` | (read-only) | Loudest channel of the active input in dB (-60..0), untargeted; the max over `peaks[0..active_input_channel_count())`, gated on `pipeline_producer_is_streaming()` so a stopped stream reads -60 (the silence floor) instead of the last frozen peak. Signal presence for the whole source; with `IND_ABOVE` and `off_delay` it drives an amplifier trigger output (8.2g). |
 | `SPDIF_LOCK` | (read-only) | 1 while the SPDIF receiver is locked. |
 | `SAMPLE_RATE` | (read-only) | Enum for `IND_EQUALS`: LED lit while the pipeline rate equals 44.1/48/96 kHz. An unrecognised rate matches nothing. |
 | `USB_STREAMING` | (read-only) | 1 while USB is the active input and the host stream is running. |
@@ -884,6 +896,20 @@ so rapid detents on two different filter knobs cannot overwrite each other.
   LED is `LEVEL` + `IND_ABOVE` with `value = -45 dB`).
 - The pin is initialized to "off" at claim and only re-driven on change.
   Indicator evaluation is decimated to **every 8 ms**, staggered across slots.
+- **Condition timing (caps v8):** `on_delay`/`off_delay` (0.1 s units) filter
+  the raw condition like a PLC TON/TOF timer: it must hold continuously true
+  for `on_delay` before the LED lights, and continuously false for
+  `off_delay` before it goes out; any blip restarts the pending edge. 0 (the
+  default) = immediate. The filter acts on the logical condition;
+  `CS_FLAG_INVERT` then only flips drive polarity, so the delays keep their
+  meaning for active-low wiring: `on_delay` always gates the
+  condition-becoming-true edge, whichever pin level that maps to.
+  Timing is wall-clock (`time_us_64`-derived), so a slow or stalled main
+  loop (e.g. a flash-write blackout) can only make the LED follow an edge
+  late, never early, and cannot stretch a minute-scale delay; a fresh
+  binding starts "off" and counts `on_delay` from activation if its
+  condition is already true. Delays on `IND_LEVEL` or any non-LED type are
+  rejected with `CS_STATUS_INVALID_VALUE`.
 
 ### 6.6 PWM LEDs (1 GPIO, hardware PWM)
 
@@ -901,6 +927,9 @@ so rapid detents on two different filter knobs cannot overwrite each other.
 - **`CS_FLAG_INVERT`** inverts the duty cycle for active-low wiring.
 - Refresh is decimated like plain LEDs (8 ms); brightness changes are applied
   only when the computed level changes.
+- `on_delay`/`off_delay` (6.5) apply to the `IND_EQUALS`/`IND_ABOVE` full-on/off
+  actions; they are rejected on `IND_LEVEL` (a continuous level has no boolean
+  edge to time).
 
 ### 6.7 Poll budget
 
@@ -1134,6 +1163,26 @@ RP2350 example: output 1 is DSP channel 8. `type=LED_PWM(6)`,
 Configure the signal first (`REQ_SIGGEN_SET_CONFIG`); the button starts and
 stops whatever config is applied.
 
+### 8.2g Amplifier trigger on GPIO 22: on with signal, off after 10 min idle
+
+The GPIO (through a driver transistor) feeds an amplifier's 12 V trigger
+input. `type=LED(5)`, `noun=INPUT_LEVEL_MAX(51=0x33)`,
+`action=IND_ABOVE(10=0x0A)`, `value=-50 dB(0xCE00)`,
+`off_delay=6000(0x1770)` = 600 s. The pin goes high the moment any channel
+of the active input crosses -50 dB and drops only after 10 unbroken minutes
+below it.
+
+```
+05 33 0A 00 16 FF 00 00 00 00 00 CE 00 00 00 00 00 00 00 00 70 17 00 00
+```
+
+Two integration cautions. Keep the threshold above -60 dB: the meter floor
+is -60 (silence and "no stream" both read as it), and `IND_ABOVE` at exactly
+-60 matches everything. And any rebind, `REQ_CS_REVERT`, or boot re-apply of
+the slot briefly releases the GPIO and restarts the filter from "off"; for a
+real amplifier trigger that is a power cycle, so reconfigure the panel with
+the amp path muted or expect the amp to drop out.
+
 ### 8.3 Clear a binding
 
 Send a binding with `type = 0` (`CS_TYPE_NONE`) to the slot; the rest of the
@@ -1302,7 +1351,27 @@ are flash-persistent) and try the decoder before the hash fallback.
 
 ## 11. Compatibility
 
-### 11.1 v6 -> v7 (caps version 7, directory unchanged)
+### 11.1 v7 -> v8 (caps version 8, directory unchanged)
+
+- **No structure size or stored-config change.** `CsBinding` stays 24 bytes:
+  `on_delay` (offset 18) and `off_delay` (offset 20) are carved from the
+  former `reserved2[6]`, leaving `reserved2[2]`. Stored and in-flight v7
+  bindings carry zeros there, which decode as "no delay", i.e. exactly the
+  v7 behavior; the directory does not migrate.
+- The delays are accepted only on `CS_TYPE_LED`/`CS_TYPE_LED_PWM` with
+  `IND_EQUALS`/`IND_ABOVE`; every other type/action combination (and the IR
+  container) must still write 0 there or the binding is rejected with
+  `CS_STATUS_INVALID_VALUE`, so a v7 host that zero-fills reserved bytes
+  keeps working unchanged.
+- One appended noun: `INPUT_LEVEL_MAX` (51, `CS_UNIT_DB`, -60..0, read-only,
+  untargeted). `noun_count` reads 52.
+- **Downgrade:** a v8 config whose LED binding carries a nonzero delay fails
+  v7 firmware's reserved2 all-zero check, so that slot loads inactive
+  (`CS_STATUS_INVALID_VALUE` in `slot_status`) rather than reverting to
+  undelayed behavior; clear the delays before downgrading if the binding
+  must survive.
+
+### 11.2 v6 -> v7 (caps version 7, directory unchanged)
 
 - **No stored-config change and no structure size change.** The directory stays
   V17 and both caps and status structures keep their sizes; nothing migrates.
@@ -1315,7 +1384,7 @@ are flash-persistent) and try the decoder before the hash fallback.
   larger value in the int16 wire fields. A host wanting 128..200 % must set it
   over the vendor command directly.
 
-### 11.2 v5 -> v6 (caps version 6, directory V17)
+### 11.3 v5 -> v6 (caps version 6, directory V17)
 
 - **Stored configs migrate automatically.** A V16 directory migrates to V17 on
   first boot: `cs_ir` is the last directory member, so every earlier field keeps
@@ -1331,7 +1400,7 @@ are flash-persistent) and try the decoder before the hash fallback.
   check and rebuilds a fresh directory (presets and CS config are lost); it does
   not misparse.
 
-### 11.3 v4 -> v5 (caps version 5, directory unchanged)
+### 11.4 v4 -> v5 (caps version 5, directory unchanged)
 
 - **No stored-config change and no structure size change.** The directory stays
   V11 and both caps and status structures keep their sizes; nothing migrates.
@@ -1345,7 +1414,7 @@ are flash-persistent) and try the decoder before the hash fallback.
   remapped existing hosts and saved presets. A front panel is free to cycle the
   modes in any order it likes.
 
-### 11.4 v3 -> v4 (caps version 4, directory unchanged)
+### 11.5 v3 -> v4 (caps version 4, directory unchanged)
 
 - **No stored-config change.** The directory stays V11; bindings, IR commands,
   and names are byte-identical, so no migration runs and firmware
@@ -1359,7 +1428,7 @@ are flash-persistent) and try the decoder before the hash fallback.
 - The six upmixer nouns are RP2350-only: on RP2040 their action masks read 0
   (unavailable), the same convention as `ADAT_ACTIVE`.
 
-### 11.5 v2 -> v3 (caps version 3, directory V11)
+### 11.6 v2 -> v3 (caps version 3, directory V11)
 
 - **Stored configs migrate automatically.** A V10 directory migrates to V11
   on first boot by appending the (empty) IR command table; bindings and
@@ -1378,7 +1447,7 @@ are flash-persistent) and try the decoder before the hash fallback.
   version check and rebuilds a fresh directory (presets and CS config are
   lost); it does not misparse.
 
-### 11.6 v1 -> v2
+### 11.7 v1 -> v2
 
 - **Stored configs migrate automatically.** A device with a V8 directory (v1
   16-byte bindings, 8 slots) migrates on first boot: the 8 bindings carry

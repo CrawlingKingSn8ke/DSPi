@@ -75,6 +75,11 @@ _Static_assert(INPUT_SOURCE_MAX == INPUT_SOURCE_SPDIF2 + SPDIF_RX_NUM_INPUTS - 2
 // Current active input source (definition in audio_input.c)
 extern volatile uint8_t active_input_source;
 
+// True while something is actually feeding process_input_block(): a locked or
+// running source, or the siggen idle pump when it would really run.  Defined
+// in main.c beside the pipeline-settle logic that is its other consumer.
+bool pipeline_producer_is_streaming(void);
+
 // SPDIF RX pin (device-level setting, stored in PresetDirectory)
 extern uint8_t spdif_rx_pin;
 

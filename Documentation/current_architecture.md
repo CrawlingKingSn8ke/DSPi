@@ -1791,7 +1791,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | DCP | N/A | Double-precision coprocessor |
 | VREG | 1.20V (for OC) | 1.10V |
 | UART + I2C external control | Yes (identical) | Yes (identical) |
-| Control Surfaces nouns (caps v7) | 51 in table, `ADAT_ACTIVE` + the 6 upmixer nouns unusable (empty action mask) | 51, all usable |
+| Control Surfaces nouns (caps v8) | 52 in table, `ADAT_ACTIVE` + the 6 upmixer nouns unusable (empty action mask) | 52, all usable |
 | Control Surfaces IR sub-slots | 16 (`CS_MAX_IR_COMMANDS`) | 16 (identical) |
 | Binary type | `default` (XIP) | `default` (XIP) |
 | Cold code location (control paths, storage, coeff design, init) | Flash XIP | Flash XIP |
@@ -2361,7 +2361,7 @@ format version is unchanged by this feature.
 ---
 
 ## Control Surfaces (User-Wired Physical Controls)
-*Last updated: 2026-08-04 (caps v7: loudness ref-SPL and intensity nouns)*
+*Last updated: 2026-08-09 (caps v8: indicator on/off delays + INPUT_LEVEL_MAX noun)*
 
 User-wired push buttons, toggle switches, potentiometers, quadrature rotary
 encoders, plain indicator LEDs, PWM-dimmed LEDs, and an IR remote receiver on
@@ -2438,6 +2438,30 @@ immediately and only the 61-step coefficient rebuild is deferred, coalesced by
 fast a knob is swept. The accepted spans now live in `loudness.h`
 (`LOUDNESS_REF_SPL_MIN`/`MAX`, `LOUDNESS_INTENSITY_MIN`/`MAX`) so the vendor
 clamps and the noun table cannot drift apart.
+
+**Caps v8** (2026-08-09) adds indicator condition timing and one noun, with no
+structure or stored-config changes (directory stays V17). `CsBinding` gains
+`on_delay` and `off_delay` (uint16, 0.1 s units, max ~109 min) carved from the
+former `reserved2[6]`, so the struct stays 24 bytes and pre-v8 configs (zeros
+there) mean "no delay". They filter the raw `IND_EQUALS`/`IND_ABOVE` condition
+like a PLC TON/TOF timer pair: the condition must hold continuously for the
+delay before the LED follows it, any blip restarts the pending edge, the
+filter runs before `CS_FLAG_INVERT`, and elapsed time is wall-clock
+(`time_us_64`-derived ms) so a slow main loop cannot stretch minute-scale
+delays. Accepted only on the LED types with those
+two actions; rejected (`CS_STATUS_INVALID_VALUE`) on `IND_LEVEL`, inputs, and
+the IR container. Runtime cost is three fields in `CsRuntime` and integer
+compares inside the existing 8 ms-decimated indicator tick; the audio path is
+untouched. The appended noun `CS_NOUN_INPUT_LEVEL_MAX` (51, read-only dB
+-60..0, untargeted) reads the loudest channel of the active input (max over
+`global_status.peaks[0..active_input_channel_count())`), gated on
+`pipeline_producer_is_streaming()` (promoted from static in main.c): peaks[]
+freezes when block delivery stops, so a dead source must read as the -60 dB
+silence floor or a trigger LED would latch on. This gives whole-source
+signal presence. The motivating combination is an amplifier trigger output:
+a plain LED binding with `INPUT_LEVEL_MAX` + `IND_ABOVE` + an `off_delay` of
+minutes drives an amp's 12 V trigger on at the first signal and off only
+after sustained silence (spec section 8.2g).
 
 ### File layout
 
@@ -2740,11 +2764,11 @@ op state ~400 B).
 | REQ_CLEAR_CLIPS | 0x83 | IN | Read-then-clear clip flags (see Clip Detection) |
 | REQ_SET_CS_BINDING | 0x84 | OUT | Set a Control Surfaces binding (wValue=slot 0-15, payload=24-byte CsBinding, required; short payload = INVALID_VALUE); apply-live-only preview, deferred, poll 0x87; persist via REQ_CS_SAVE (see Control Surfaces) |
 | REQ_GET_CS_BINDING | 0x85 | IN | Get the live 24-byte CsBinding for a slot (wValue=slot) |
-| REQ_GET_CS_CAPS | 0x86 | IN | Get capability tables (wValue=0xFFFF: 40-byte header+type table+max_ir_commands, caps v4; wValue=noun: 12-byte CsNounDesc) |
-| REQ_GET_CS_STATUS | 0x87 | IN | Get 32-byte CsStatusPacket (last SET result, dirty flag, active_mask, per-slot status, ir_active_mask, learn state, per-sub-slot IR status) |
+| REQ_GET_CS_CAPS | 0x86 | IN | Get capability tables (wValue=0xFFFF: 40-byte header+type table+max_ir_commands, caps v8; wValue=noun: 12-byte CsNounDesc) |
+| REQ_GET_CS_STATUS | 0x87 | IN | Get 41-byte CsStatusPacket (last SET result, dirty flag, active_mask, per-slot status, ir_active_mask, learn state, per-sub-slot IR status) |
 | REQ_SET_CS_NAME | 0x8B | OUT | Set a Control Surfaces slot name (wValue=slot 0-15, payload=1-32 bytes; one NUL byte clears); apply-live-only preview (persist via 0x9D), poll 0x87 for result |
 | REQ_GET_CS_NAME | 0x8C | IN | Get a Control Surfaces slot name (wValue=slot, returns 32 bytes NUL-terminated, live) |
-| REQ_SET_CS_IR_CMD | 0x8D | OUT | Set a Control Surfaces IR remote command (wValue=sub-slot 0-7, payload=16-byte IrCommand); apply-live-only, deferred; poll 0x87 (last_slot = 0x80\|sub) |
+| REQ_SET_CS_IR_CMD | 0x8D | OUT | Set a Control Surfaces IR remote command (wValue=sub-slot 0-15, payload=16-byte IrCommand); apply-live-only, deferred; poll 0x87 (last_slot = 0x80\|sub) |
 | REQ_GET_CS_IR_CMD | 0x8E | IN | Get an IR remote command (wValue=sub-slot, returns 16-byte IrCommand) |
 | REQ_CS_IR_LEARN | 0x8F | IN | IR learn control: wValue 1=arm (10 s window), 0=cancel, 2=read result (8 bytes: state, protocol, 0, 0, code_LE32); completion also pushed as notify 0x0A |
 | REQ_PRESET_SAVE | 0x90 | IN | Save live state to preset slot (wValue=slot) |
