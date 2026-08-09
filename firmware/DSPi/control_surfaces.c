@@ -288,6 +288,10 @@ static uint32_t  s_macro_delay = 0;              // ticks left before the step r
 static bool      s_macro_fired = false;          // step dispatched, draining BUSY
 static CsOpState s_macro_op;                     // single-target step dispatches
 static CsGroupOp s_macro_gop;                    // grouped step dispatches
+// Snapshot of the step taken at fire time.  BUSY retries dispatch from this,
+// never the live table, so a host editing the draining step cannot retarget
+// an in-flight value.
+static CsMacroStep s_macro_cur;
 
 // Standard quadrature transition table, indexed by (prev << 2) | curr.
 // Invalid two-bit jumps decode as 0 (skipped sample, no movement credited).
@@ -1720,6 +1724,7 @@ static void cs_tick_macro(void) {
         memcpy(prev_key, key, sizeof(prev_key));
         prev_key_valid = true;
     }
+    s_macro_cur = *s;
     if (cs_binding_grouped(&v)) cs_group_press(&v, &s_macro_gop);
     else                        cs_button_press(&v, &s_macro_op);
     s_macro_fired = true;
@@ -2056,10 +2061,10 @@ void control_surfaces_tick(void) {
     }
 
     // Macro sequencer: retry its op contexts (with the same session aging),
-    // then advance the sequence.
+    // then advance the sequence.  Retries use the fire-time step snapshot,
+    // not the live table, so concurrent step edits cannot retarget them.
     if (s_macro_run != 0xFF) {
-        const CsMacroStep *ms = &s_macros.macros[s_macro_run].steps[s_macro_step];
-        CsBinding v = cs_macro_step_view(ms);
+        CsBinding v = cs_macro_step_view(&s_macro_cur);
         if (s_macro_op.pending &&
             cs_noun_dispatch(v.noun, v.target, v.index, s_macro_op.value))
             s_macro_op.pending = false;
