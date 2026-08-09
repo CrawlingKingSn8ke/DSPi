@@ -13,6 +13,7 @@
 #include "bulk_params.h"
 #include "notify.h"
 #include "config.h"
+#include "control_surfaces.h"   // CsMacro sizes TX_COPY_MAX
 
 #include "pico/stdlib.h"
 #include "hardware/uart.h"
@@ -34,10 +35,10 @@
 #define RX_RING_SIZE         256u                 // power of two
 #define RX_RING_MASK         (RX_RING_SIZE - 1u)
 #define PAYLOAD_MAX          64u                  // non-bulk SET payload cap
-// Matches the dispatcher's 64-byte resp_buf (nothing larger can escape a
-// non-bulk GET) and the I2C transport's copy buffer, so both transports
-// share one truncation threshold.
-#define TX_COPY_MAX          64u                  // GET response copy buffer
+// Matches the dispatcher's _ext_resp_copy sink and the I2C copy buffer, all
+// sized by the largest non-bulk GET (the 132-byte CsMacro); the three must
+// move together or that GET silently truncates on one transport.
+#define TX_COPY_MAX          ((uint16_t)sizeof(CsMacro))   // GET response copy buffer
 
 #define FRAME_TIMEOUT_US     100000u              // inter-byte mid-frame timeout
 #define DISPATCH_RETRY_US    50000u               // transient-status retry window

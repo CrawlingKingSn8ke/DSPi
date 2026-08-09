@@ -1329,6 +1329,91 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
             break;
         }
 
+        case REQ_SET_CS_GROUP: {
+            // Deferred to main loop, same single-deep handoff as the binding
+            // SET: apply re-validates every grouped binding, so it must not
+            // run in the USB control path.  Groups are tagged 0x40 | idx in
+            // cs_last_slot to keep them distinct from binding slots.
+            uint8_t slot = vendor_last_wValue & 0xFF;
+            if (slot >= CS_MAX_GROUPS) {
+                cs_last_status = CS_STATUS_INVALID_GROUP;
+                cs_last_slot = 0x40 | slot;
+            } else if (cs_set_group_pending) {
+                cs_last_status = CS_STATUS_BUSY;
+                cs_last_slot = 0x40 | slot;
+            } else if (buffer->data_len >= sizeof(CsGroup)) {
+                memcpy((void *)&cs_set_group_val, vendor_rx_buf, sizeof(CsGroup));
+                cs_set_group_slot = slot;
+                cs_last_status = CS_STATUS_PENDING;
+                cs_last_slot = 0x40 | slot;
+                __dmb();
+                cs_set_group_pending = true;
+            } else {
+                cs_last_status = CS_STATUS_INVALID_VALUE;
+                cs_last_slot = 0x40 | slot;
+            }
+            break;
+        }
+
+        case REQ_SET_CS_MACRO: {
+            // Macro header (name + step_count) only; the steps arrive through
+            // REQ_SET_CS_MACRO_STEP, which owns a separate pending flag so a
+            // header and a step may be in flight at once.  Macros are tagged
+            // 0x60 | idx in cs_last_slot.
+            uint8_t slot = vendor_last_wValue & 0xFF;
+            if (slot >= CS_MAX_MACROS) {
+                cs_last_status = CS_STATUS_INVALID_MACRO;
+                cs_last_slot = 0x60 | slot;
+            } else if (cs_set_macro_hdr_pending) {
+                cs_last_status = CS_STATUS_BUSY;
+                cs_last_slot = 0x60 | slot;
+            } else if (buffer->data_len >= sizeof(CsMacroHeaderWire)) {
+                memcpy((void *)&cs_set_macro_hdr_val, vendor_rx_buf,
+                       sizeof(CsMacroHeaderWire));
+                cs_set_macro_hdr_slot = slot;
+                cs_last_status = CS_STATUS_PENDING;
+                cs_last_slot = 0x60 | slot;
+                __dmb();
+                cs_set_macro_hdr_pending = true;
+            } else {
+                cs_last_status = CS_STATUS_INVALID_VALUE;
+                cs_last_slot = 0x60 | slot;
+            }
+            break;
+        }
+
+        case REQ_SET_CS_MACRO_STEP: {
+            // wValue packs (step << 8) | macro; both indices are range-checked
+            // here so the main-loop apply only ever sees addressable slots.
+            // BUSY is judged against this command's own pending flag, not the
+            // header's.
+            uint8_t slot = vendor_last_wValue & 0xFF;
+            uint8_t step = (vendor_last_wValue >> 8) & 0xFF;
+            if (slot >= CS_MAX_MACROS) {
+                cs_last_status = CS_STATUS_INVALID_MACRO;
+                cs_last_slot = 0x60 | slot;
+            } else if (step >= CS_MAX_MACRO_STEPS) {
+                cs_last_status = CS_STATUS_INVALID_STEP;
+                cs_last_slot = 0x60 | slot;
+            } else if (cs_set_macro_step_pending) {
+                cs_last_status = CS_STATUS_BUSY;
+                cs_last_slot = 0x60 | slot;
+            } else if (buffer->data_len >= sizeof(CsMacroStep)) {
+                memcpy((void *)&cs_set_macro_step_val, vendor_rx_buf,
+                       sizeof(CsMacroStep));
+                cs_set_macro_step_slot = slot;
+                cs_set_macro_step_idx = step;
+                cs_last_status = CS_STATUS_PENDING;
+                cs_last_slot = 0x60 | slot;
+                __dmb();
+                cs_set_macro_step_pending = true;
+            } else {
+                cs_last_status = CS_STATUS_INVALID_VALUE;
+                cs_last_slot = 0x60 | slot;
+            }
+            break;
+        }
+
         case REQ_SET_CHANNEL_NAME: {
             // wValue = channel index, payload = 1-32 bytes of name
             uint8_t ch = vendor_last_wValue & 0xFF;
@@ -1542,7 +1627,9 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
 // stays zero-copy.  USB tolerates stack buffers up to 64 bytes because
 // tud_control_xfer copies one EP0 transaction's worth synchronously;
 // anything larger must be static (today only the bulk buffer is).
-static uint8_t _ext_resp_copy[64];
+// Sized for the largest non-bulk GET (the 132-byte CsMacro); anything
+// bigger must go through the bulk buffer path.
+static uint8_t _ext_resp_copy[sizeof(CsMacro)];
 static void vendor_send_response(const void *data, uint16_t len) {
     if (_active_source == CTRL_SOURCE_USB) {
         tud_control_xfer(_vendor_rhport, _vendor_current_req, (void *)data, len);
@@ -2481,6 +2568,60 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                 resp_buf[0] = 1;
                 vendor_send_response(resp_buf, 1);
                 return true;
+            }
+
+            case REQ_GET_CS_GROUP: {
+                // wValue = group index; returns the live 40-byte record.
+                if (setup->wValue >= CS_MAX_GROUPS) return false;
+                const CsGroup *g = control_surfaces_get_group((uint8_t)setup->wValue);
+                if (g == NULL) return false;
+                vendor_send_response(g, sizeof(CsGroup));
+                return true;
+            }
+
+            case REQ_GET_CS_MACRO: {
+                // wValue = macro index; returns the whole live 132-byte
+                // macro.  _ext_resp_copy is sized to fit it, so UART/I2C
+                // readers get the full record like USB does.
+                if (setup->wValue >= CS_MAX_MACROS) return false;
+                const CsMacro *m = control_surfaces_get_macro((uint8_t)setup->wValue);
+                if (m == NULL) return false;
+                vendor_send_response(m, sizeof(CsMacro));
+                return true;
+            }
+
+            case REQ_GET_CS_EXT_STATUS: {
+                // 24-byte group/macro companion to REQ_GET_CS_STATUS: table
+                // limits, per-slot validity, and the running macro.
+                CsExtStatusPacket pkt;
+                control_surfaces_get_ext_status(&pkt);
+                vendor_send_response(&pkt, sizeof(pkt));
+                return true;
+            }
+
+            case REQ_CS_MACRO_FIRE: {
+                // GET-style action: wValue = macro fires it, 0xFFFF cancels
+                // the running one.  Every dispatch transport runs on the core0
+                // main loop, so the sequencer calls are safe here.
+                if (setup->wValue == 0xFFFF) {
+                    control_surfaces_macro_cancel();
+                    resp_buf[0] = 1;
+                    vendor_send_response(resp_buf, 1);
+                    return true;
+                }
+                if (setup->wValue < CS_MAX_MACROS) {
+                    uint8_t rc = control_surfaces_macro_fire((uint8_t)setup->wValue);
+                    if (rc != PIN_CONFIG_SUCCESS) {
+                        // Stall and leave the reason for REQ_GET_CS_STATUS.
+                        cs_last_status = rc;
+                        cs_last_slot = 0x60 | (uint8_t)setup->wValue;
+                        return false;
+                    }
+                    resp_buf[0] = 1;
+                    vendor_send_response(resp_buf, 1);
+                    return true;
+                }
+                return false;
             }
 
             case REQ_GET_ALL_PARAMS_CHUNK: {

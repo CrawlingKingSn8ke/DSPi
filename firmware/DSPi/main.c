@@ -2429,9 +2429,68 @@ int main(void) {
                 }
             }
 
+            // Control Surfaces group SET (deferred).  Live-only preview like
+            // the binding SET; the apply re-validates dependent bindings and
+            // may take some down.  Groups report as 0x40 | idx.
+            if (cs_set_group_pending) {
+                CsGroup g;
+                uint8_t slot;
+                uint32_t f = save_and_disable_interrupts();
+                memcpy(&g, (const void *)&cs_set_group_val, sizeof(g));
+                slot = cs_set_group_slot;
+                cs_set_group_pending = false;
+                restore_interrupts(f);
+                uint8_t status = control_surfaces_apply_group(slot, &g);
+                cs_last_status = status;
+                cs_last_slot = 0x40 | slot;
+                if (status == PIN_CONFIG_SUCCESS) {
+                    control_surfaces_set_dirty(true);
+                }
+            }
+
+            // Control Surfaces macro header SET (deferred).  Name and step
+            // count only; the steps come through their own handoff below.
+            // Macros report as 0x60 | idx.
+            if (cs_set_macro_hdr_pending) {
+                CsMacroHeaderWire h;
+                uint8_t slot;
+                uint32_t f = save_and_disable_interrupts();
+                memcpy(&h, (const void *)&cs_set_macro_hdr_val, sizeof(h));
+                slot = cs_set_macro_hdr_slot;
+                cs_set_macro_hdr_pending = false;
+                restore_interrupts(f);
+                uint8_t status = control_surfaces_apply_macro_header(slot, &h);
+                cs_last_status = status;
+                cs_last_slot = 0x60 | slot;
+                if (status == PIN_CONFIG_SUCCESS) {
+                    control_surfaces_set_dirty(true);
+                }
+            }
+
+            // Control Surfaces macro step SET (deferred).  Macro and step
+            // indices were both range-checked at the vendor handler; the
+            // sequencer re-validates the record at fire time anyway.
+            if (cs_set_macro_step_pending) {
+                CsMacroStep s;
+                uint8_t slot, step;
+                uint32_t f = save_and_disable_interrupts();
+                memcpy(&s, (const void *)&cs_set_macro_step_val, sizeof(s));
+                slot = cs_set_macro_step_slot;
+                step = cs_set_macro_step_idx;
+                cs_set_macro_step_pending = false;
+                restore_interrupts(f);
+                uint8_t status = control_surfaces_apply_macro_step(slot, step, &s);
+                cs_last_status = status;
+                cs_last_slot = 0x60 | slot;
+                if (status == PIN_CONFIG_SUCCESS) {
+                    control_surfaces_set_dirty(true);
+                }
+            }
+
             // Control Surfaces SAVE (deferred).  Persist the whole live
-            // config (bindings + IR commands + slot names) in one directory
-            // flash write, then clear the dirty preview flag on success.
+            // config (bindings + IR commands + slot names + groups + macros)
+            // in one directory flash write, then clear the dirty preview flag
+            // on success.
             if (cs_save_pending) {
                 uint32_t f = save_and_disable_interrupts();
                 cs_save_pending = false;
@@ -2439,7 +2498,9 @@ int main(void) {
                 prepare_flash_write_operation();
                 uint8_t rc = preset_set_cs_all(control_surfaces_config(),
                                                control_surfaces_ir_config(),
-                                               control_surfaces_names());
+                                               control_surfaces_names(),
+                                               control_surfaces_group_config(),
+                                               control_surfaces_macro_config());
                 complete_flash_write_operation_full();
                 cs_last_status = (rc == PRESET_OK) ? PIN_CONFIG_SUCCESS
                                                    : CS_STATUS_FLASH_ERROR;

@@ -58,6 +58,13 @@
  * INPUT_LEVEL_MAX noun (loudest channel of the active input).  Struct sizes
  * are unchanged; pre-v8 configs carry zeros there, meaning no delay.
  *
+ * Caps v9 adds target groups (8 named channel sets a binding or macro step
+ * addresses as a unit via CS_FLAG_GROUP) and macros (8 step sequences fired
+ * through the CS_NOUN_MACRO noun), commands 0x20-0x26, directory V18.
+ * CsBinding/IrCommand/CsStatusPacket are unchanged; the caps header's three
+ * reserved bytes become max_groups/max_macros/max_macro_steps.
+ * See Documentation/Features/control_surfaces_groups_macros_spec.md.
+ *
  * See Documentation/Features/control_surfaces_spec.md.
  */
 
@@ -146,6 +153,10 @@ typedef enum {
     // --- caps v8 additions ---
     CS_NOUN_INPUT_LEVEL_MAX = 51, // continuous dB, read-only; loudest channel of
                                   // the active input (signal-presence sensing)
+    // --- caps v9 additions ---
+    CS_NOUN_MACRO          = 52, // enum 0..CS_MAX_MACROS-1; SET fires macro
+                                 // `value`, IND_EQUALS lights while it runs;
+                                 // live read = running index, 255 idle
     CS_NOUN_COUNT
 } CsNoun;
 
@@ -213,7 +224,12 @@ typedef enum {
 #define CS_FLAG_WRAP     0x04  // enum STEP/INC/DEC wraps around the ends
 #define CS_FLAG_ACCEL    0x08  // encoder: fast rotation multiplies the step
 #define CS_FLAG_REPEAT   0x10  // button INC/DEC: auto-repeat while held
-#define CS_FLAG_ALL      0x1F
+// Group flags (caps v9).  GROUP re-reads `target` as a group index; the two
+// modifiers require it (LINK_ABS: ADJUST drives members identical instead of
+// offset-preserving; GROUP_ALL: indicator needs every member, not any).
+#define CS_FLAG_GROUP    0x20
+#define CS_FLAG_LINK_ABS 0x40
+#define CS_FLAG_GROUP_ALL 0x80
 
 // Pin classes (CsTypeDesc.pin_class)
 #define CS_PINCLASS_ANY  0
@@ -221,6 +237,12 @@ typedef enum {
 
 #define CS_MAX_BINDINGS  16
 #define CS_GPIO_UNUSED   0xFF
+
+// Target groups and macros (caps v9).  Sizes are frozen into the flash
+// blobs below; growing them later is a config-format bump.
+#define CS_MAX_GROUPS       8
+#define CS_MAX_MACROS       8
+#define CS_MAX_MACRO_STEPS  8
 
 // IR remote control.  One CS_TYPE_IR binding (the receiver) may be live at a
 // time; its remote-button commands live in a separate table of sub-slots so
@@ -327,6 +349,81 @@ typedef struct __attribute__((packed)) {
     IrCommand cmds[CS_MAX_IR_COMMANDS];
 } CsIrConfig;              // 260 bytes
 
+// One target group; 40 bytes, identical on the wire (REQ_SET/GET_CS_GROUP
+// payload) and in flash.  target_kind 0 marks the slot empty (the record
+// must then be all-zero).  member_mask bit N = channel N of the kind's
+// space; 32-bit because the RP2350 DSP-channel space exceeds 16.
+typedef struct __attribute__((packed)) {
+    uint8_t  target_kind;  // CS_TARGET_INPUT_CH / _OUTPUT_CH / _DSP_CH; 0 = empty
+    uint8_t  reserved[3];  // write 0
+    uint32_t member_mask;
+    char     name[CS_NAME_LEN];
+} CsGroup;                 // 40 bytes
+
+// Group table, directory-persisted (device-global, V18+).  All-zero = no
+// groups; a fresh directory needs no seeding.
+#define CS_GROUP_CONFIG_VERSION  1
+typedef struct __attribute__((packed)) {
+    uint8_t  version;      // CS_GROUP_CONFIG_VERSION
+    uint8_t  reserved[3];
+    CsGroup  groups[CS_MAX_GROUPS];
+} CsGroupConfig;           // 324 bytes
+
+// One macro step; 12 bytes, identical on the wire (REQ_SET_CS_MACRO_STEP
+// payload) and in flash.  A stripped button-shaped binding: actions SET /
+// TOGGLE / INC / DEC / TRIGGER, flags WRAP | GROUP, fired by the sequencer
+// after pre_delay (10 ms units).  All-zero = empty step (skipped).
+typedef struct __attribute__((packed)) {
+    uint8_t  noun;         // CsNoun (not CS_NOUN_MACRO; no nesting)
+    uint8_t  action;       // CsAction (step subset)
+    uint8_t  flags;        // CS_FLAG_WRAP | CS_FLAG_GROUP
+    uint8_t  target;       // channel index, or group index with CS_FLAG_GROUP
+    uint8_t  index;        // filter band for CS_TARGET_DSP_BAND nouns (else 0)
+    uint8_t  reserved;     // write 0
+    int16_t  value;        // as CsBinding.value
+    int16_t  step;         // INC/DEC size; 0 = per-unit default
+    uint16_t pre_delay;    // delay before this step runs, 10 ms units
+} CsMacroStep;             // 12 bytes
+
+typedef struct __attribute__((packed)) {
+    char        name[CS_NAME_LEN];
+    uint8_t     step_count;    // steps executed = steps[0..step_count-1]; 0 = empty
+    uint8_t     reserved[3];   // write 0
+    CsMacroStep steps[CS_MAX_MACRO_STEPS];
+} CsMacro;                 // 132 bytes
+
+// Macro table, directory-persisted (device-global, V18+).  All-zero = no
+// macros.
+#define CS_MACRO_CONFIG_VERSION  1
+typedef struct __attribute__((packed)) {
+    uint8_t  version;      // CS_MACRO_CONFIG_VERSION
+    uint8_t  reserved[3];
+    CsMacro  macros[CS_MAX_MACROS];
+} CsMacroConfig;           // 1060 bytes
+
+// REQ_SET_CS_MACRO payload: name + step count only.  Steps are SET one at a
+// time (the whole 132-byte CsMacro exceeds the 64-byte vendor SET buffer);
+// hosts should write steps first and the header last so a concurrent fire
+// never sees step_count exceed the written steps.
+typedef struct __attribute__((packed)) {
+    char     name[CS_NAME_LEN];
+    uint8_t  step_count;
+    uint8_t  reserved[3];  // write 0
+} CsMacroHeaderWire;       // 36 bytes
+
+// REQ_GET_CS_EXT_STATUS response.  Group/macro validity mirrors slot_status
+// semantics; macro_running is 0xFF when the sequencer is idle.
+typedef struct __attribute__((packed)) {
+    uint8_t max_groups;        // CS_MAX_GROUPS
+    uint8_t max_macros;        // CS_MAX_MACROS
+    uint8_t max_macro_steps;   // CS_MAX_MACRO_STEPS
+    uint8_t macro_running;     // running macro index; 0xFF = idle
+    uint8_t macro_step;        // current step index while running (else 0)
+    uint8_t reserved[3];
+    uint8_t group_status[CS_MAX_GROUPS];   // stored-record validity
+    uint8_t macro_status[CS_MAX_MACROS];   // worst step validity
+} CsExtStatusPacket;       // 24 bytes
+
 // Capability descriptors (REQ_GET_CS_CAPS).  wValue = 0xFFFF returns the
 // header + type table; wValue = noun index returns that noun's descriptor.
 typedef struct __attribute__((packed)) {
@@ -336,7 +433,7 @@ typedef struct __attribute__((packed)) {
 } CsTypeDesc;
 
 typedef struct __attribute__((packed)) {
-    uint8_t  caps_version; // capability format version (8); see the file
+    uint8_t  caps_version; // capability format version (9); see the file
                            // header for what each version added
     uint8_t  max_bindings; // CS_MAX_BINDINGS
     uint8_t  type_count;   // CS_TYPE_COUNT (table follows, index = CsType)
@@ -346,7 +443,10 @@ typedef struct __attribute__((packed)) {
     // CS_TYPE_IR type descriptor's action mask describes what its COMMANDS
     // may do; the container binding itself carries noun/action 0.
     uint8_t  max_ir_commands;  // CS_MAX_IR_COMMANDS
-    uint8_t  reserved[3];
+    // v9: carved from the former reserved[3]; pre-v9 hosts read zeros.
+    uint8_t  max_groups;       // CS_MAX_GROUPS
+    uint8_t  max_macros;       // CS_MAX_MACROS
+    uint8_t  max_macro_steps;  // CS_MAX_MACRO_STEPS
 } CsCapsHeader;            // 4 + 4*CS_TYPE_COUNT + 4 = 40 bytes
 
 typedef struct __attribute__((packed)) {
@@ -400,6 +500,10 @@ typedef struct __attribute__((packed)) {
                                         // component (one receiver per device)
 #define CS_STATUS_NO_IR           0x1E  // IR command/learn needs a live
                                         // CS_TYPE_IR binding first
+#define CS_STATUS_INVALID_GROUP   0x1F  // group reference empty, out of range,
+                                        // or kind-incompatible with the noun
+#define CS_STATUS_INVALID_MACRO   0x20  // bad macro index or step_count
+#define CS_STATUS_INVALID_STEP    0x21  // macro step record invalid
 
 // ---------------------------------------------------------------------------
 // Public API (all main-loop context)
@@ -451,6 +555,34 @@ const CsNounDesc *control_surfaces_noun_desc(uint8_t noun);   // NULL if bad nou
 // when it comes up.  Returns PIN_CONFIG_* / CS_STATUS_*.
 uint8_t control_surfaces_apply_ir_cmd(uint8_t sub, const IrCommand *c);
 
+// Validate and apply one group (all-zero record clears the slot).  Live-only
+// preview like apply_binding; the caller marks the config dirty.  Re-validates
+// every active grouped binding: dependents that no longer validate go down
+// with the failure in slot_status (no in-use refusal), and reactivate when a
+// later group SET makes them valid again.  Returns PIN_CONFIG_* / CS_STATUS_*.
+uint8_t control_surfaces_apply_group(uint8_t idx, const CsGroup *g);
+
+// Validate and apply a macro header (name + step_count) or one step (all-zero
+// clears it).  Live-only previews; the caller marks the config dirty.  Steps
+// are also re-validated at fire time, so a torn edit skips, never faults.
+uint8_t control_surfaces_apply_macro_header(uint8_t idx, const CsMacroHeaderWire *h);
+uint8_t control_surfaces_apply_macro_step(uint8_t idx, uint8_t step,
+                                          const CsMacroStep *s);
+
+// Fire macro `idx` (cancelling any running macro at its step boundary) or
+// cancel the running one.  Main-loop only.  Returns PIN_CONFIG_SUCCESS or
+// CS_STATUS_INVALID_MACRO.  Firing an empty macro succeeds as a no-op.
+uint8_t control_surfaces_macro_fire(uint8_t idx);
+void    control_surfaces_macro_cancel(void);
+
+// Live tables (persistence sources for REQ_CS_SAVE) and read-only accessors
+// for the vendor GET handlers.
+const CsGroupConfig *control_surfaces_group_config(void);
+const CsMacroConfig *control_surfaces_macro_config(void);
+const CsGroup *control_surfaces_get_group(uint8_t idx);   // NULL if bad index
+const CsMacro *control_surfaces_get_macro(uint8_t idx);   // NULL if bad index
+void control_surfaces_get_ext_status(CsExtStatusPacket *out);
+
 // Re-apply the persisted config (bindings + IR commands + slot names) from
 // the directory cache, discarding the live preview.  Per-slot failures land
 // in slot_status exactly as at boot.  Main-loop only (releases and reclaims
@@ -488,10 +620,25 @@ extern volatile bool    cs_set_ir_cmd_pending;
 extern uint8_t          cs_set_ir_cmd_slot;
 extern IrCommand        cs_set_ir_cmd_val;
 
+// Deferred group / macro SETs (REQ_SET_CS_GROUP / _CS_MACRO /
+// _CS_MACRO_STEP); same single-deep handoff shape as the binding SET.
+// Results land in cs_last_status with cs_last_slot = 0x40 | group or
+// 0x60 | macro.
+extern volatile bool    cs_set_group_pending;
+extern uint8_t          cs_set_group_slot;
+extern CsGroup          cs_set_group_val;
+extern volatile bool    cs_set_macro_hdr_pending;
+extern uint8_t          cs_set_macro_hdr_slot;
+extern CsMacroHeaderWire cs_set_macro_hdr_val;
+extern volatile bool    cs_set_macro_step_pending;
+extern uint8_t          cs_set_macro_step_slot;   // macro index
+extern uint8_t          cs_set_macro_step_idx;    // step index
+extern CsMacroStep      cs_set_macro_step_val;
+
 // Deferred save / revert (REQ_CS_SAVE / REQ_CS_REVERT).  Save persists the
-// whole live CS config (bindings + IR commands + slot names) in one
-// directory write; revert re-applies the stored config.  Results land in
-// cs_last_status (cs_last_slot = 0xFF).
+// whole live CS config (bindings + IR commands + slot names + groups +
+// macros) in one directory write; revert re-applies the stored config.
+// Results land in cs_last_status (cs_last_slot = 0xFF).
 extern volatile bool    cs_save_pending;
 extern volatile bool    cs_revert_pending;
 
@@ -521,7 +668,12 @@ bool cs_noun_dispatch(uint8_t noun, uint8_t target, uint8_t index, float value);
 
 // Validate a binding's target/index against the noun's addressing kind and
 // the platform's live channel/band layout.  Returns PIN_CONFIG_SUCCESS or
-// CS_STATUS_INVALID_TARGET.
+// CS_STATUS_INVALID_TARGET.  Single-target form; grouped bindings validate
+// each resolved member through cs_noun_validate_target_ch.
 uint8_t cs_noun_validate_target(const CsBinding *b);
+uint8_t cs_noun_validate_target_ch(uint8_t noun, uint8_t ch, uint8_t index);
+
+// Running macro index (255 = idle); the CS_NOUN_MACRO live read.
+uint8_t cs_macro_running_index(void);
 
 #endif // CONTROL_SURFACES_H

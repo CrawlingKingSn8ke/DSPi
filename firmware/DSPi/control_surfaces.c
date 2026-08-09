@@ -108,6 +108,18 @@ IrCommand        cs_set_ir_cmd_val;
 volatile bool    cs_save_pending = false;
 volatile bool    cs_revert_pending = false;
 
+// Deferred group / macro SET handoffs (caps v9)
+volatile bool    cs_set_group_pending = false;
+uint8_t          cs_set_group_slot = 0;
+CsGroup          cs_set_group_val;
+volatile bool    cs_set_macro_hdr_pending = false;
+uint8_t          cs_set_macro_hdr_slot = 0;
+CsMacroHeaderWire cs_set_macro_hdr_val;
+volatile bool    cs_set_macro_step_pending = false;
+uint8_t          cs_set_macro_step_slot = 0;
+uint8_t          cs_set_macro_step_idx = 0;
+CsMacroStep      cs_set_macro_step_val;
+
 // ---------------------------------------------------------------------------
 // Type capability table; the per-noun half lives in control_surfaces_nouns.c.
 // REQ_GET_CS_CAPS serves these verbatim, so host UIs and the firmware can
@@ -115,7 +127,7 @@ volatile bool    cs_revert_pending = false;
 // ---------------------------------------------------------------------------
 
 static const CsCapsHeader s_caps = {
-    .caps_version = 8,
+    .caps_version = 9,
     .max_bindings = CS_MAX_BINDINGS,
     .type_count   = CS_TYPE_COUNT,
     .noun_count   = CS_NOUN_COUNT,
@@ -140,7 +152,9 @@ static const CsCapsHeader s_caps = {
                               1, CS_PINCLASS_ANY },
     },
     .max_ir_commands = CS_MAX_IR_COMMANDS,
-    .reserved = {0},
+    .max_groups      = CS_MAX_GROUPS,
+    .max_macros      = CS_MAX_MACROS,
+    .max_macro_steps = CS_MAX_MACRO_STEPS,
 };
 
 // ---------------------------------------------------------------------------
@@ -233,6 +247,47 @@ static uint16_t      s_ir_fire_gap = 0;
 
 // Defined in the IR command section below; used by cs_release_pins.
 static void cs_ir_release_momentary(uint8_t sub);
+
+// ---------------------------------------------------------------------------
+// Group / macro state (caps v9)
+// ---------------------------------------------------------------------------
+
+// One in-flight grouped operation.  base[] is indexed by member channel and
+// double-duties as the gesture-session capture (REL/ADJ, log units stored in
+// log2 domain) and the momentary restore set (natural units).
+typedef struct {
+    uint8_t  mode;          // CS_GOP_*
+    uint32_t member_mask;   // members resolved at op/session start
+    uint32_t pend_mask;     // members whose dispatch is still owed (BUSY)
+    uint16_t age;           // ticks since the last event (session expiry)
+    float    delta;         // REL/ADJ accumulated offset (octaves for log units)
+    float    abs_value;     // ABS/engage target; ADJ stores the capture mean
+    float    base[NUM_CHANNELS];
+} CsGroupOp;
+
+#define CS_GOP_IDLE         0
+#define CS_GOP_REL          1   // step session: target = base + delta
+#define CS_GOP_ADJ          2   // pot offset law: same math, delta = pot - mean
+#define CS_GOP_ABS          3   // one value for every member
+#define CS_GOP_MOM_ENGAGE   4   // momentary held: abs_value out, base[] captured
+#define CS_GOP_MOM_RESTORE  5   // momentary released: base[] back out
+
+#define CS_GROUP_SESSION_TICKS  500   // idle gap that ends a gesture session
+
+static CsGroupConfig s_groups;                   // live group table
+static CsMacroConfig s_macros;                   // live macro table
+static uint8_t       s_group_status[CS_MAX_GROUPS];
+static uint8_t       s_macro_status[CS_MAX_MACROS];
+static CsGroupOp     s_gop[CS_MAX_BINDINGS];
+
+// Macro sequencer: one macro at a time; a new fire cancels the old one at
+// its current step boundary.
+static uint8_t   s_macro_run = 0xFF;             // running macro (0xFF idle)
+static uint8_t   s_macro_step = 0;
+static uint32_t  s_macro_delay = 0;              // ticks left before the step runs
+static bool      s_macro_fired = false;          // step dispatched, draining BUSY
+static CsOpState s_macro_op;                     // single-target step dispatches
+static CsGroupOp s_macro_gop;                    // grouped step dispatches
 
 // Standard quadrature transition table, indexed by (prev << 2) | curr.
 // Invalid two-bit jumps decode as 0 (skipped sample, no movement credited).
@@ -344,6 +399,244 @@ static float cs_base_value(const CsBinding *b, const CsOpState *op) {
     if (op->pending) return op->value;
     if (op->shadow_active) return op->shadow;
     return cs_noun_get(b->noun, b->target, b->index);
+}
+
+// ---------------------------------------------------------------------------
+// Group fan-out engine.  A grouped op resolves every member's absolute
+// target up front, then dispatches member by member; BUSY members stay in
+// pend_mask and retry each tick.  Sessions replace the single-target shadow:
+// bases are captured once per gesture, so detents never coalesce against a
+// stale live value of a deferred-apply noun.  See the feature spec, s4.
+// ---------------------------------------------------------------------------
+
+// Defined in the Actions section below; the anchor rule needs it here.
+static int cs_enum_step(const CsBinding *b, const CsOpState *op, int dir);
+
+static bool cs_binding_grouped(const CsBinding *b) {
+    return (b->flags & CS_FLAG_GROUP) != 0;
+}
+
+// A group is usable by a live op iff its stored record validated and it has
+// members inside the noun's channel space.
+static uint32_t cs_group_members(const CsBinding *b) {
+    const CsNounDesc *nd = &cs_noun_table[b->noun];
+    if (b->target >= CS_MAX_GROUPS) return 0;
+    if (s_group_status[b->target] != PIN_CONFIG_SUCCESS) return 0;
+    uint32_t lim = (nd->target_count >= 32) ? 0xFFFFFFFFu
+                                            : ((1u << nd->target_count) - 1u);
+    return s_groups.groups[b->target].member_mask & lim;
+}
+
+static uint8_t cs_mask_lowest(uint32_t m) {
+    return (uint8_t)__builtin_ctz(m);
+}
+
+// Capture the session bases (log units in log2 domain so delta is octaves).
+static void cs_gop_capture(const CsBinding *b, CsGroupOp *gop, uint32_t members) {
+    const CsNounDesc *nd = &cs_noun_table[b->noun];
+    bool logu = cs_unit_is_log(nd->unit);
+    gop->member_mask = members;
+    for (uint32_t m = members; m; m &= m - 1) {
+        uint8_t ch = cs_mask_lowest(m);
+        float v = cs_noun_get(b->noun, ch, b->index);
+        if (logu) v = (v > 0.0f) ? log2f(v) : 0.0f;
+        gop->base[ch] = v;
+    }
+}
+
+// Member target for the current op, clamped to the noun's range.
+static float cs_gop_target(const CsBinding *b, const CsGroupOp *gop, uint8_t ch) {
+    const CsNounDesc *nd = &cs_noun_table[b->noun];
+    switch (gop->mode) {
+        case CS_GOP_REL:
+        case CS_GOP_ADJ: {
+            float v = gop->base[ch] + gop->delta;
+            if (cs_unit_is_log(nd->unit)) v = exp2f(v);
+            float lo = cs_decode(nd->unit, nd->min_q);
+            float hi = cs_decode(nd->unit, nd->max_q);
+            return cs_clampf(v, lo, hi);
+        }
+        case CS_GOP_MOM_RESTORE:
+            return gop->base[ch];
+        default:  // ABS / MOM_ENGAGE
+            return gop->abs_value;
+    }
+}
+
+// Dispatch every pending member once; survivors retry next tick.  Only a
+// finished momentary restore idles here; REL/ADJ/ABS stay up as the live
+// gesture session (the tick ages them out) so rapid events on deferred
+// nouns fold against the session instead of a stale live read.
+static void cs_gop_pump(const CsBinding *b, CsGroupOp *gop) {
+    for (uint32_t m = gop->pend_mask; m; m &= m - 1) {
+        uint8_t ch = cs_mask_lowest(m);
+        if (cs_noun_dispatch(b->noun, ch, b->index, cs_gop_target(b, gop, ch)))
+            gop->pend_mask &= ~(1u << ch);
+    }
+    if (gop->pend_mask == 0 && gop->mode == CS_GOP_MOM_RESTORE)
+        gop->mode = CS_GOP_IDLE;
+}
+
+// One value to every member (SET / FOLLOW / anchor results / pot LINK_ABS).
+static void cs_group_abs(const CsBinding *b, CsGroupOp *gop, float value) {
+    uint32_t members = cs_group_members(b);
+    if (!members) return;
+    gop->mode = CS_GOP_ABS;
+    gop->member_mask = members;
+    gop->abs_value = value;
+    gop->pend_mask = members;
+    gop->age = 0;
+    cs_gop_pump(b, gop);
+}
+
+// Relative step, offset-preserving: each member walks from its own value
+// captured at session start.  Re-queues every member on each detent so a
+// BUSY straggler never applies a stale target.
+static void cs_group_step(const CsBinding *b, CsGroupOp *gop, int dir, int steps) {
+    const CsNounDesc *nd = &cs_noun_table[b->noun];
+    if (nd->kind == CS_KIND_CONTINUOUS) {
+        uint32_t members = cs_group_members(b);
+        if (!members) return;
+        if (gop->mode != CS_GOP_REL || gop->age >= CS_GROUP_SESSION_TICKS ||
+            gop->member_mask != members) {
+            gop->mode = CS_GOP_REL;
+            gop->delta = 0.0f;
+            cs_gop_capture(b, gop, members);
+        }
+        gop->delta += (float)(dir * steps) * cs_step_size(b, nd->unit);
+        gop->age = 0;
+        gop->pend_mask = members;
+        cs_gop_pump(b, gop);
+    } else {
+        // Anchor rule: compute the step against the lowest member, then
+        // drive the whole group to the anchor's new value so a mixed group
+        // becomes coherent on the first event.  A live ABS session stands
+        // in for the anchor's value the way the single-target shadow does,
+        // so detents on a deferred noun are not coalesced away.
+        uint32_t members = cs_group_members(b);
+        if (!members) return;
+        CsBinding av = *b;
+        av.flags &= (uint8_t)~CS_FLAG_GROUP;
+        av.target = cs_mask_lowest(members);
+        CsOpState tmp;
+        memset(&tmp, 0, sizeof(tmp));
+        if (gop->mode == CS_GOP_ABS && gop->member_mask == members) {
+            tmp.shadow_active = true;
+            tmp.shadow = gop->abs_value;
+        }
+        int t = cs_enum_step(&av, &tmp, dir);
+        if (t >= 0) cs_group_abs(b, gop, (float)t);
+    }
+}
+
+// Momentary on a group: capture per-member restores at the press, drive all
+// members to `value`, restore each member on release.
+static void cs_group_momentary_engage(const CsBinding *b, CsGroupOp *gop) {
+    uint32_t members = cs_group_members(b);
+    if (!members) return;
+    cs_gop_capture(b, gop, members);
+    gop->mode = CS_GOP_MOM_ENGAGE;
+    gop->abs_value = (float)b->value;
+    gop->pend_mask = members;
+    gop->age = 0;
+    cs_gop_pump(b, gop);
+}
+
+static void cs_group_momentary_release(const CsBinding *b, CsGroupOp *gop) {
+    if (gop->mode != CS_GOP_MOM_ENGAGE) return;
+    gop->mode = CS_GOP_MOM_RESTORE;
+    gop->pend_mask = gop->member_mask;
+    cs_gop_pump(b, gop);
+}
+
+// Grouped button press dispatch (the grouped half of cs_button_press).
+static void cs_group_press(const CsBinding *b, CsGroupOp *gop) {
+    const CsNounDesc *nd = &cs_noun_table[b->noun];
+    switch (b->action) {
+        case CS_ACT_INC: cs_group_step(b, gop, +1, 1); break;
+        case CS_ACT_DEC: cs_group_step(b, gop, -1, 1); break;
+        case CS_ACT_TOGGLE: {
+            uint32_t members = cs_group_members(b);
+            if (!members) return;
+            // The live ABS session is the anchor's effective value (shadow
+            // rule); without it a double-tap on a deferred bool re-reads the
+            // stale live value and the second press is lost.
+            float anchor = (gop->mode == CS_GOP_ABS && gop->member_mask == members)
+                         ? gop->abs_value
+                         : cs_noun_get(b->noun, cs_mask_lowest(members), b->index);
+            cs_group_abs(b, gop, anchor >= 0.5f ? 0.0f : 1.0f);
+            break;
+        }
+        case CS_ACT_SET: {
+            float v = (nd->kind == CS_KIND_CONTINUOUS)
+                    ? cs_decode(nd->unit, b->value) : (float)b->value;
+            cs_group_abs(b, gop, v);
+            break;
+        }
+        default: break;   // TRIGGER is never grouped (validation)
+    }
+}
+
+// Combined indicator condition over the members: ANY by default, ALL with
+// CS_FLAG_GROUP_ALL.  An empty/invalid group reads as condition off.
+static uint8_t cs_group_ind_cond(const CsBinding *b, bool above) {
+    const CsNounDesc *nd = &cs_noun_table[b->noun];
+    uint32_t members = cs_group_members(b);
+    if (!members) return 0;
+    bool all = (b->flags & CS_FLAG_GROUP_ALL) != 0;
+    for (uint32_t m = members; m; m &= m - 1) {
+        uint8_t ch = cs_mask_lowest(m);
+        float v = cs_noun_get(b->noun, ch, b->index);
+        uint8_t c = above ? (v >= cs_decode(nd->unit, b->value) ? 1 : 0)
+                          : ((int)v == (int)b->value ? 1 : 0);
+        if (all && !c) return 0;
+        if (!all && c) return 1;
+    }
+    return all ? 1 : 0;
+}
+
+// Pot ADJUST on a group.  LINK_ABS drives every member to the pot value;
+// the default offset law moves the group mean to the pot value while each
+// member keeps its offset from the mean captured at the session start
+// (log units work in log2 domain so offsets are ratios).
+static void cs_group_adjust(const CsBinding *b, CsGroupOp *gop, float value) {
+    if (b->flags & CS_FLAG_LINK_ABS) {
+        cs_group_abs(b, gop, value);
+        return;
+    }
+    const CsNounDesc *nd = &cs_noun_table[b->noun];
+    uint32_t members = cs_group_members(b);
+    if (!members) return;
+    if (gop->mode != CS_GOP_ADJ || gop->age >= CS_GROUP_SESSION_TICKS ||
+        gop->member_mask != members) {
+        gop->mode = CS_GOP_ADJ;
+        cs_gop_capture(b, gop, members);
+        float sum = 0.0f;
+        int n = 0;
+        for (uint32_t m = members; m; m &= m - 1) {
+            sum += gop->base[cs_mask_lowest(m)];
+            n++;
+        }
+        gop->abs_value = sum / (float)n;   // capture mean
+    }
+    float v = cs_unit_is_log(nd->unit) ? ((value > 0.0f) ? log2f(value) : 0.0f)
+                                       : value;
+    gop->delta = v - gop->abs_value;
+    gop->age = 0;
+    gop->pend_mask = members;
+    cs_gop_pump(b, gop);
+}
+
+// IND_LEVEL over a group follows the loudest member.
+static float cs_group_ind_level(const CsBinding *b) {
+    uint32_t members = cs_group_members(b);
+    if (!members) return -INFINITY;
+    float best = -INFINITY;
+    for (uint32_t m = members; m; m &= m - 1) {
+        float v = cs_noun_get(b->noun, cs_mask_lowest(m), b->index);
+        if (v > best) best = v;
+    }
+    return best;
 }
 
 // ---------------------------------------------------------------------------
@@ -498,7 +791,8 @@ static void cs_group_fire(const CsBtnGroup *g, uint8_t event, bool is_repeat) {
         if (b->action == CS_ACT_MOMENTARY) continue;
         if (b->event != event) continue;
         if (is_repeat && !(b->flags & CS_FLAG_REPEAT)) continue;
-        cs_button_press(b, &s_rt[s].op);
+        if (cs_binding_grouped(b)) cs_group_press(b, &s_gop[s]);
+        else                       cs_button_press(b, &s_rt[s].op);
     }
 }
 
@@ -508,8 +802,13 @@ static void cs_group_momentary(const CsBtnGroup *g, bool engage) {
         const CsBinding *b = &s_cfg.bindings[s];
         if (b->type != CS_TYPE_BUTTON || b->gpio[0] != g->pin) continue;
         if (b->action != CS_ACT_MOMENTARY) continue;
-        if (engage) cs_momentary_engage(b, &s_rt[s].op);
-        else        cs_momentary_release(b, &s_rt[s].op);
+        if (cs_binding_grouped(b)) {
+            if (engage) cs_group_momentary_engage(b, &s_gop[s]);
+            else        cs_group_momentary_release(b, &s_gop[s]);
+        } else {
+            if (engage) cs_momentary_engage(b, &s_rt[s].op);
+            else        cs_momentary_release(b, &s_rt[s].op);
+        }
     }
 }
 
@@ -623,7 +922,8 @@ static void cs_tick_switch(uint8_t slot) {
     rt->sw_stable = rt->sw_candidate;
     // A switch is authoritative, including at claim/boot (matches the
     // pot's immediate-takeover semantics).
-    cs_queue_op(b, &rt->op, (float)rt->sw_stable);
+    if (cs_binding_grouped(b)) cs_group_abs(b, &s_gop[slot], (float)rt->sw_stable);
+    else                       cs_queue_op(b, &rt->op, (float)rt->sw_stable);
 }
 
 static void cs_tick_encoder(uint8_t slot) {
@@ -650,7 +950,8 @@ static void cs_tick_encoder(uint8_t slot) {
         else if (gap < CS_ACCEL_GAP_X2) steps = 2;
     }
     rt->enc_gap = 0;
-    cs_apply_step(b, &rt->op, dir, steps);
+    if (cs_binding_grouped(b)) cs_group_step(b, &s_gop[slot], dir, steps);
+    else                       cs_apply_step(b, &rt->op, dir, steps);
 }
 
 // Map a filtered ADC reading onto the binding's span, quantized per unit.
@@ -680,11 +981,14 @@ static void cs_tick_pot(uint8_t slot) {
 
     if (rt->pot_settle) {
         // Immediate-takeover boot sync: once the EMA settles, the knob's
-        // physical position becomes the value.
+        // physical position becomes the value (the group mean for a grouped
+        // pot under the offset law).
         if (--rt->pot_settle == 0) {
             rt->pot_sent_q = cs_pot_map(b, nd, rt->pot_filt);
             rt->pot_sent_raw = rt->pot_filt;
-            cs_queue_op(b, &rt->op, cs_unquantize(nd, rt->pot_sent_q));
+            float v = cs_unquantize(nd, rt->pot_sent_q);
+            if (cs_binding_grouped(b)) cs_group_adjust(b, &s_gop[slot], v);
+            else                       cs_queue_op(b, &rt->op, v);
         }
         return;
     }
@@ -696,7 +1000,9 @@ static void cs_tick_pot(uint8_t slot) {
     if (q != rt->pot_sent_q) {
         rt->pot_sent_q = q;
         rt->pot_sent_raw = rt->pot_filt;
-        cs_queue_op(b, &rt->op, cs_unquantize(nd, q));
+        float v = cs_unquantize(nd, q);
+        if (cs_binding_grouped(b)) cs_group_adjust(b, &s_gop[slot], v);
+        else                       cs_queue_op(b, &rt->op, v);
     }
 }
 
@@ -722,12 +1028,16 @@ static void cs_tick_led(uint8_t slot) {
     const CsBinding *b = &s_cfg.bindings[slot];
     const CsNounDesc *nd = &cs_noun_table[b->noun];
     CsRuntime *rt = &s_rt[slot];
-    float v = cs_noun_get(b->noun, b->target, b->index);
     uint8_t raw;
-    if (b->action == CS_ACT_IND_ABOVE)
-        raw = (v >= cs_decode(nd->unit, b->value)) ? 1 : 0;
-    else
-        raw = ((int)v == (int)b->value) ? 1 : 0;
+    if (cs_binding_grouped(b)) {
+        raw = cs_group_ind_cond(b, b->action == CS_ACT_IND_ABOVE);
+    } else {
+        float v = cs_noun_get(b->noun, b->target, b->index);
+        if (b->action == CS_ACT_IND_ABOVE)
+            raw = (v >= cs_decode(nd->unit, b->value)) ? 1 : 0;
+        else
+            raw = ((int)v == (int)b->value) ? 1 : 0;
+    }
     uint8_t lit = cs_ind_delay(b, rt, raw);
     if (lit == rt->led_lit) return;
     rt->led_lit = lit;
@@ -738,9 +1048,11 @@ static void cs_tick_led_pwm(uint8_t slot) {
     const CsBinding *b = &s_cfg.bindings[slot];
     const CsNounDesc *nd = &cs_noun_table[b->noun];
     CsRuntime *rt = &s_rt[slot];
-    float v = cs_noun_get(b->noun, b->target, b->index);
+    bool grouped = cs_binding_grouped(b);
     uint16_t level;
     if (b->action == CS_ACT_IND_LEVEL) {
+        float v = grouped ? cs_group_ind_level(b)
+                          : cs_noun_get(b->noun, b->target, b->index);
         float lo, hi;
         cs_span(b, nd, &lo, &hi);
         float norm = cs_unit_is_log(nd->unit)
@@ -753,9 +1065,15 @@ static void cs_tick_led_pwm(uint8_t slot) {
         // Square the normalized position; a perceptually even sweep.
         level = (uint16_t)(norm * norm * (float)CS_PWM_WRAP);
     } else {
-        uint8_t raw = (b->action == CS_ACT_IND_ABOVE)
-                    ? (v >= cs_decode(nd->unit, b->value) ? 1 : 0)
-                    : ((int)v == (int)b->value ? 1 : 0);
+        uint8_t raw;
+        if (grouped) {
+            raw = cs_group_ind_cond(b, b->action == CS_ACT_IND_ABOVE);
+        } else {
+            float v = cs_noun_get(b->noun, b->target, b->index);
+            raw = (b->action == CS_ACT_IND_ABOVE)
+                ? (v >= cs_decode(nd->unit, b->value) ? 1 : 0)
+                : ((int)v == (int)b->value ? 1 : 0);
+        }
         level = cs_ind_delay(b, rt, raw) ? CS_PWM_WRAP : 0;
     }
     if (b->flags & CS_FLAG_INVERT) level = CS_PWM_WRAP - level;
@@ -917,6 +1235,55 @@ static void cs_recount_active(void) {
         if (s_rt[i].active) { s_any_active = true; break; }
 }
 
+// Grouped-binding reference check: the group must exist, be valid and
+// non-empty, and its kind must match the noun's channel space (DSP_BAND
+// nouns take DSP_CH groups; the band index must be valid on every member).
+static uint8_t cs_validate_group_ref(const CsBinding *b) {
+    const CsNounDesc *nd = &cs_noun_table[b->noun];
+    if (b->target >= CS_MAX_GROUPS) return CS_STATUS_INVALID_GROUP;
+    if (s_group_status[b->target] != PIN_CONFIG_SUCCESS)
+        return CS_STATUS_INVALID_GROUP;
+    const CsGroup *g = &s_groups.groups[b->target];
+    uint8_t want;
+    switch (nd->target_kind) {
+        case CS_TARGET_INPUT_CH:  want = CS_TARGET_INPUT_CH;  break;
+        case CS_TARGET_OUTPUT_CH: want = CS_TARGET_OUTPUT_CH; break;
+        case CS_TARGET_DSP_CH:
+        case CS_TARGET_DSP_BAND:  want = CS_TARGET_DSP_CH;    break;
+        default: return CS_STATUS_INVALID_GROUP;   // untargeted noun
+    }
+    if (g->target_kind != want) return CS_STATUS_INVALID_GROUP;
+    uint32_t lim = (nd->target_count >= 32) ? 0xFFFFFFFFu
+                                            : ((1u << nd->target_count) - 1u);
+    uint32_t members = g->member_mask & lim;
+    if (!members) return CS_STATUS_INVALID_GROUP;
+    for (uint32_t m = members; m; m &= m - 1) {
+        uint8_t st = cs_noun_validate_target_ch(b->noun, cs_mask_lowest(m),
+                                                b->index);
+        if (st != PIN_CONFIG_SUCCESS) return st;
+    }
+    return PIN_CONFIG_SUCCESS;
+}
+
+// Group-flag context rules shared by bindings and macro steps: modifiers
+// need GROUP, LINK_ABS is only meaningful on a grouped pot, GROUP_ALL only
+// on a grouped boolean indicator condition.
+static uint8_t cs_validate_group_flags(uint8_t flags, uint8_t action,
+                                       const CsNounDesc *nd) {
+    if (!(flags & CS_FLAG_GROUP)) {
+        if (flags & (CS_FLAG_LINK_ABS | CS_FLAG_GROUP_ALL))
+            return CS_STATUS_INVALID_VALUE;
+        return PIN_CONFIG_SUCCESS;
+    }
+    if ((flags & CS_FLAG_LINK_ABS) &&
+        (action != CS_ACT_ADJUST || nd->kind != CS_KIND_CONTINUOUS))
+        return CS_STATUS_INVALID_VALUE;
+    if ((flags & CS_FLAG_GROUP_ALL) &&
+        action != CS_ACT_IND_EQUALS && action != CS_ACT_IND_ABOVE)
+        return CS_STATUS_INVALID_VALUE;
+    return PIN_CONFIG_SUCCESS;
+}
+
 // Value / step / range bounds per noun kind; shared by binding and IR
 // command validation.
 static uint8_t cs_validate_values(const CsBinding *b, const CsNounDesc *nd) {
@@ -975,7 +1342,9 @@ static uint8_t cs_validate(const CsBinding *b, uint8_t slot) {
     if (b->noun >= CS_NOUN_COUNT) return CS_STATUS_INVALID_NOUN;
     if (b->action >= CS_ACT_COUNT) return CS_STATUS_INVALID_ACTION;
 
-    if (b->flags & (uint8_t)~CS_FLAG_ALL) return CS_STATUS_INVALID_VALUE;
+    uint8_t gst = cs_validate_group_flags(b->flags, b->action,
+                                          &cs_noun_table[b->noun]);
+    if (gst != PIN_CONFIG_SUCCESS) return gst;
     if (b->reserved != 0) return CS_STATUS_INVALID_VALUE;
     for (int i = 0; i < (int)sizeof(b->reserved2); i++)
         if (b->reserved2[i] != 0) return CS_STATUS_INVALID_VALUE;
@@ -1018,7 +1387,8 @@ static uint8_t cs_validate(const CsBinding *b, uint8_t slot) {
         if ((b->flags & CS_FLAG_ACCEL) && b->type != CS_TYPE_ENCODER)
             return CS_STATUS_INVALID_VALUE;
 
-        uint8_t tst = cs_noun_validate_target(b);
+        uint8_t tst = cs_binding_grouped(b) ? cs_validate_group_ref(b)
+                                            : cs_noun_validate_target(b);
         if (tst != PIN_CONFIG_SUCCESS) return tst;
 
         uint8_t vst = cs_validate_values(b, nd);
@@ -1208,6 +1578,262 @@ static void cs_tick_ir(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Macros.  One sequencer; steps are button-shaped bindings executed on the
+// tick after their pre_delay, re-validated at fire time so a torn edit or a
+// since-emptied group skips the step instead of faulting.
+// ---------------------------------------------------------------------------
+
+// A step viewed as a binding, for the shared op / validation helpers.
+static CsBinding cs_macro_step_view(const CsMacroStep *s) {
+    CsBinding b;
+    memset(&b, 0, sizeof(b));
+    b.type   = CS_TYPE_BUTTON;   // ignored by the op helpers
+    b.noun   = s->noun;
+    b.action = s->action;
+    b.flags  = s->flags;
+    b.target = s->target;
+    b.index  = s->index;
+    b.value  = s->value;
+    b.step   = s->step;
+    return b;
+}
+
+#define CS_MACRO_STEP_ACTS  (CS_ACT_BIT(CS_ACT_SET) | CS_ACT_BIT(CS_ACT_TOGGLE) | \
+                             CS_ACT_BIT(CS_ACT_INC) | CS_ACT_BIT(CS_ACT_DEC) | \
+                             CS_ACT_BIT(CS_ACT_TRIGGER))
+
+// All-zero marks an empty step (valid, skipped at run time).
+static bool cs_macro_step_empty(const CsMacroStep *s) {
+    const uint8_t *p = (const uint8_t *)s;
+    for (size_t i = 0; i < sizeof(*s); i++)
+        if (p[i] != 0) return false;
+    return true;
+}
+
+static uint8_t cs_validate_macro_step(const CsMacroStep *s) {
+    if (cs_macro_step_empty(s)) return PIN_CONFIG_SUCCESS;
+    if (s->noun >= CS_NOUN_COUNT || s->noun == CS_NOUN_MACRO)
+        return CS_STATUS_INVALID_STEP;   // no nesting
+    if (s->action >= CS_ACT_COUNT ||
+        !(CS_MACRO_STEP_ACTS & CS_ACT_BIT(s->action)))
+        return CS_STATUS_INVALID_STEP;
+    if (s->flags & (uint8_t)~(CS_FLAG_WRAP | CS_FLAG_GROUP))
+        return CS_STATUS_INVALID_STEP;
+    if (s->reserved != 0) return CS_STATUS_INVALID_STEP;
+    const CsNounDesc *nd = &cs_noun_table[s->noun];
+    if (!(nd->actions & CS_ACT_BIT(s->action))) return CS_STATUS_INVALID_ACTION;
+    CsBinding v = cs_macro_step_view(s);
+    uint8_t tst = cs_binding_grouped(&v) ? cs_validate_group_ref(&v)
+                                         : cs_noun_validate_target(&v);
+    if (tst != PIN_CONFIG_SUCCESS) return tst;
+    return cs_validate_values(&v, nd);
+}
+
+// Worst validity across a macro's executed steps, for the ext status.
+static void cs_macro_recount_status(void) {
+    for (uint8_t i = 0; i < CS_MAX_MACROS; i++) {
+        uint8_t worst = PIN_CONFIG_SUCCESS;
+        uint8_t n = s_macros.macros[i].step_count;
+        if (n > CS_MAX_MACRO_STEPS) { s_macro_status[i] = CS_STATUS_INVALID_MACRO; continue; }
+        for (uint8_t k = 0; k < n; k++) {
+            uint8_t st = cs_validate_macro_step(&s_macros.macros[i].steps[k]);
+            if (st != PIN_CONFIG_SUCCESS) worst = st;
+        }
+        s_macro_status[i] = worst;
+    }
+}
+
+uint8_t cs_macro_running_index(void) { return s_macro_run; }
+
+uint8_t control_surfaces_macro_fire(uint8_t idx) {
+    if (idx >= CS_MAX_MACROS) return CS_STATUS_INVALID_MACRO;
+    // Cancel-at-step-boundary: anything already dispatched stands, the old
+    // macro's undelivered work is dropped with its op contexts.
+    memset(&s_macro_op, 0, sizeof(s_macro_op));
+    memset(&s_macro_gop, 0, sizeof(s_macro_gop));
+    uint8_t n = s_macros.macros[idx].step_count;
+    if (n == 0 || n > CS_MAX_MACRO_STEPS) {
+        s_macro_run = 0xFF;              // empty macro: a successful no-op
+        return PIN_CONFIG_SUCCESS;
+    }
+    s_macro_run = idx;
+    s_macro_step = 0;
+    s_macro_delay = (uint32_t)s_macros.macros[idx].steps[0].pre_delay * 10u;
+    s_macro_fired = false;
+    return PIN_CONFIG_SUCCESS;
+}
+
+void control_surfaces_macro_cancel(void) {
+    s_macro_run = 0xFF;
+    memset(&s_macro_op, 0, sizeof(s_macro_op));
+    memset(&s_macro_gop, 0, sizeof(s_macro_gop));
+}
+
+// Advance to `step` (or finish), loading its pre-delay.
+static void cs_macro_advance(uint8_t step) {
+    const CsMacro *m = &s_macros.macros[s_macro_run];
+    if (step >= m->step_count) {
+        s_macro_run = 0xFF;
+        return;
+    }
+    s_macro_step = step;
+    s_macro_delay = (uint32_t)m->steps[step].pre_delay * 10u;
+    s_macro_fired = false;
+}
+
+static void cs_tick_macro(void) {
+    if (s_macro_run == 0xFF) return;
+    const CsMacro *m = &s_macros.macros[s_macro_run];
+
+    if (s_macro_fired) {
+        // Drain the step's BUSY-pending work before the next step's delay
+        // starts, so sequences serialize even across flash blackouts.
+        if (s_macro_op.pending || s_macro_gop.pend_mask) return;
+        cs_macro_advance((uint8_t)(s_macro_step + 1));
+        return;
+    }
+    if (s_macro_delay > 0) { s_macro_delay--; return; }
+
+    // A header SET may have cut step_count while this step sat in its
+    // pre-delay; the shortened macro ends here instead of firing the cut tail.
+    if (s_macro_step >= m->step_count) {
+        s_macro_run = 0xFF;
+        return;
+    }
+    const CsMacroStep *s = &m->steps[s_macro_step];
+    if (cs_macro_step_empty(s) ||
+        cs_validate_macro_step(s) != PIN_CONFIG_SUCCESS) {
+        cs_macro_advance((uint8_t)(s_macro_step + 1));   // skip, not fatal
+        return;
+    }
+    CsBinding v = cs_macro_step_view(s);
+    // Op state carries over only between consecutive steps addressing the
+    // same noun/target (so a repeated INC accumulates against its shadow);
+    // otherwise a stale session/shadow would pollute the new step.
+    static uint8_t prev_key[4];   // zero-init keeps this out of .data
+    static bool prev_key_valid;
+    uint8_t key[4] = {s->noun, s->target, s->index,
+                      (uint8_t)(s->flags & CS_FLAG_GROUP)};
+    if (!prev_key_valid || memcmp(key, prev_key, sizeof(key)) != 0) {
+        memset(&s_macro_op, 0, sizeof(s_macro_op));
+        memset(&s_macro_gop, 0, sizeof(s_macro_gop));
+        memcpy(prev_key, key, sizeof(prev_key));
+        prev_key_valid = true;
+    }
+    if (cs_binding_grouped(&v)) cs_group_press(&v, &s_macro_gop);
+    else                        cs_button_press(&v, &s_macro_op);
+    s_macro_fired = true;
+}
+
+// ---------------------------------------------------------------------------
+// Group / macro apply (deferred SET consumers) and dependent re-validation
+// ---------------------------------------------------------------------------
+
+static uint8_t cs_validate_group(const CsGroup *g) {
+    if (g->target_kind == CS_TARGET_NONE) {
+        // Clearing: the record must be all-zero (strict, like bindings).
+        const uint8_t *p = (const uint8_t *)g;
+        for (size_t i = 0; i < sizeof(*g); i++)
+            if (p[i] != 0) return CS_STATUS_INVALID_VALUE;
+        return PIN_CONFIG_SUCCESS;
+    }
+    uint8_t count;
+    switch (g->target_kind) {
+        case CS_TARGET_INPUT_CH:  count = NUM_INPUT_CHANNELS;  break;
+        case CS_TARGET_OUTPUT_CH: count = NUM_OUTPUT_CHANNELS; break;
+        case CS_TARGET_DSP_CH:    count = NUM_CHANNELS;        break;
+        default: return CS_STATUS_INVALID_GROUP;
+    }
+    for (int i = 0; i < (int)sizeof(g->reserved); i++)
+        if (g->reserved[i] != 0) return CS_STATUS_INVALID_VALUE;
+    uint32_t lim = (count >= 32) ? 0xFFFFFFFFu : ((1u << count) - 1u);
+    if (g->member_mask == 0 || (g->member_mask & ~lim))
+        return CS_STATUS_INVALID_GROUP;
+    return PIN_CONFIG_SUCCESS;
+}
+
+// Re-validate one grouped binding after its group was edited: down it
+// (releasing pins) when it no longer validates, bring it back up when it
+// does again.  Mirrors the boot rule; there is no in-use refusal.  A still-
+// valid active binding keeps its runtime (no pot re-seed, no LED glitch);
+// only its group context resets, since the member set may have changed.
+static void cs_revalidate_grouped_slot(uint8_t slot) {
+    const CsBinding *b = &s_cfg.bindings[slot];
+    if (s_rt[slot].active) {
+        // A group edit cannot change pin validity, so an active binding
+        // only needs the group-dependent half re-checked.
+        uint8_t st = cs_validate_group_ref(b);
+        if (st == PIN_CONFIG_SUCCESS) {
+            cs_group_momentary_release(b, &s_gop[slot]);
+            memset(&s_gop[slot], 0, sizeof(s_gop[slot]));
+            s_slot_status[slot] = PIN_CONFIG_SUCCESS;
+            return;
+        }
+        cs_group_momentary_release(b, &s_gop[slot]);
+        s_rt[slot].active = false;
+        cs_release_pins(slot, b);
+        memset(&s_gop[slot], 0, sizeof(s_gop[slot]));
+        s_slot_status[slot] = st;
+        return;
+    }
+    // Previously-down slot: full check (its pins were released), reclaim on
+    // success so a repaired group resurrects its bindings.
+    memset(&s_gop[slot], 0, sizeof(s_gop[slot]));
+    uint8_t st = cs_validate(b, slot);
+    if (st == PIN_CONFIG_SUCCESS) {
+        cs_claim_pins(slot);
+        cs_seed_runtime(slot);
+    }
+    s_slot_status[slot] = st;
+}
+
+uint8_t control_surfaces_apply_group(uint8_t idx, const CsGroup *g) {
+    if (idx >= CS_MAX_GROUPS || !g) return CS_STATUS_INVALID_SLOT;
+    uint8_t st = cs_validate_group(g);
+    if (st != PIN_CONFIG_SUCCESS) return st;   // stored group kept intact
+    s_groups.groups[idx] = *g;
+    s_groups.groups[idx].name[CS_NAME_LEN - 1] = '\0';
+    s_group_status[idx] = PIN_CONFIG_SUCCESS;
+    // Only bindings referencing THIS group can change validity.
+    for (uint8_t s = 0; s < CS_MAX_BINDINGS; s++) {
+        const CsBinding *b = &s_cfg.bindings[s];
+        if (b->type == CS_TYPE_NONE || b->type == CS_TYPE_IR) continue;
+        if (!cs_binding_grouped(b) || b->target != idx) continue;
+        cs_revalidate_grouped_slot(s);
+    }
+    cs_recount_active();
+    cs_rebuild_groups();
+    cs_macro_recount_status();
+    return PIN_CONFIG_SUCCESS;
+}
+
+uint8_t control_surfaces_apply_macro_header(uint8_t idx, const CsMacroHeaderWire *h) {
+    if (idx >= CS_MAX_MACROS || !h) return CS_STATUS_INVALID_MACRO;
+    if (h->step_count > CS_MAX_MACRO_STEPS) return CS_STATUS_INVALID_MACRO;
+    for (int i = 0; i < (int)sizeof(h->reserved); i++)
+        if (h->reserved[i] != 0) return CS_STATUS_INVALID_VALUE;
+    CsMacro *m = &s_macros.macros[idx];
+    memcpy(m->name, h->name, CS_NAME_LEN);
+    m->name[CS_NAME_LEN - 1] = '\0';
+    m->step_count = h->step_count;
+    // A running macro whose tail was just cut finishes at the new boundary
+    // (cs_macro_advance re-checks step_count each advance).
+    cs_macro_recount_status();
+    return PIN_CONFIG_SUCCESS;
+}
+
+uint8_t control_surfaces_apply_macro_step(uint8_t idx, uint8_t step,
+                                          const CsMacroStep *s) {
+    if (idx >= CS_MAX_MACROS) return CS_STATUS_INVALID_MACRO;
+    if (step >= CS_MAX_MACRO_STEPS || !s) return CS_STATUS_INVALID_STEP;
+    uint8_t st = cs_validate_macro_step(s);
+    if (st != PIN_CONFIG_SUCCESS) return st;   // stored step kept intact
+    s_macros.macros[idx].steps[step] = *s;
+    cs_macro_recount_status();
+    return PIN_CONFIG_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -1225,13 +1851,18 @@ uint8_t control_surfaces_apply_binding(uint8_t slot, const CsBinding *nb) {
     if (slot >= CS_MAX_BINDINGS || !nb) return CS_STATUS_INVALID_SLOT;
 
     // Release this slot first so the new pins can reuse them; restore the
-    // old binding untouched if the new one fails validation.
+    // old binding untouched if the new one fails validation.  An engaged
+    // momentary restores best-effort before its state is discarded, so a
+    // rebind mid-hold cannot leave the parameter stuck at the held value.
     CsBinding old = s_cfg.bindings[slot];
     bool was_active = s_rt[slot].active;
     if (was_active) {
+        if (cs_binding_grouped(&old)) cs_group_momentary_release(&old, &s_gop[slot]);
+        else                          cs_momentary_release(&old, &s_rt[slot].op);
         s_rt[slot].active = false;
         cs_release_pins(slot, &old);
     }
+    memset(&s_gop[slot], 0, sizeof(s_gop[slot]));
 
     if (nb->type != CS_TYPE_NONE) {
         uint8_t st = cs_validate(nb, slot);
@@ -1295,11 +1926,53 @@ static void __attribute__((noinline)) cs_load_stored_ir(void) {
     }
 }
 
+// Groups and macros load BEFORE bindings: grouped bindings validate against
+// the live group table.  A stored record that fails validation is kept
+// (round-trips through save) but marked, so refs treat it as absent.
+// Copies straight into the live tables; a stack snapshot of the 1060-byte
+// macro blob would not fit the 2 KB main stack beside the binding frames.
+static void cs_load_stored_groups_macros(void) {
+    preset_get_cs_groups(&s_groups);
+    if (s_groups.version > CS_GROUP_CONFIG_VERSION) {
+        memset(&s_groups, 0, sizeof(s_groups));   // future format stays idle
+        s_groups.version = CS_GROUP_CONFIG_VERSION;
+    }
+    for (uint8_t i = 0; i < CS_MAX_GROUPS; i++) {
+        s_groups.groups[i].name[CS_NAME_LEN - 1] = '\0';
+        s_group_status[i] = cs_validate_group(&s_groups.groups[i]);
+    }
+    preset_get_cs_macros(&s_macros);
+    if (s_macros.version > CS_MACRO_CONFIG_VERSION) {
+        memset(&s_macros, 0, sizeof(s_macros));
+        s_macros.version = CS_MACRO_CONFIG_VERSION;
+    }
+    for (uint8_t i = 0; i < CS_MAX_MACROS; i++) {
+        s_macros.macros[i].name[CS_NAME_LEN - 1] = '\0';
+        if (s_macros.macros[i].step_count > CS_MAX_MACRO_STEPS)
+            s_macros.macros[i].step_count = CS_MAX_MACRO_STEPS;
+    }
+    cs_macro_recount_status();
+}
+
 static void cs_load_stored(void) {
+    cs_load_stored_groups_macros();
     cs_load_stored_bindings();
     cs_load_stored_ir();
     for (uint8_t slot = 0; slot < CS_MAX_BINDINGS; slot++)
         preset_get_cs_name(slot, s_names[slot]);
+}
+
+// Shared group/macro state reset for init and revert: sequencer idle, group
+// contexts cleared, live tables zeroed for the reload.
+static void cs_reset_groups_macros(void) {
+    memset(&s_groups, 0, sizeof(s_groups));
+    s_groups.version = CS_GROUP_CONFIG_VERSION;
+    memset(&s_macros, 0, sizeof(s_macros));
+    s_macros.version = CS_MACRO_CONFIG_VERSION;
+    memset(s_group_status, 0, sizeof(s_group_status));
+    memset(s_macro_status, 0, sizeof(s_macro_status));
+    memset(s_gop, 0, sizeof(s_gop));
+    control_surfaces_macro_cancel();
 }
 
 void control_surfaces_init(void) {
@@ -1314,6 +1987,7 @@ void control_surfaces_init(void) {
     memset(s_ir_cmd_status, 0, sizeof(s_ir_cmd_status));
     s_ir_slot = 0xFF;
     s_ir_hold = false;
+    cs_reset_groups_macros();
     cs_load_stored();
 }
 
@@ -1330,11 +2004,14 @@ void control_surfaces_revert(void) {
     s_ir.version = CS_IR_CONFIG_VERSION;
     memset(s_ir_op, 0, sizeof(s_ir_op));
     memset(s_ir_cmd_status, 0, sizeof(s_ir_cmd_status));
+    cs_reset_groups_macros();
     cs_load_stored();
 }
 
 void control_surfaces_tick(void) {
-    if (!s_any_active) return;
+    // A macro fired by the host (REQ_CS_MACRO_FIRE) must run with zero
+    // bindings active, so the sequencer keeps the tick alive too.
+    if (!s_any_active && s_macro_run == 0xFF) return;
     uint64_t now = time_us_64();
     if (now - s_last_tick_us < CS_TICK_INTERVAL_US) return;
     s_last_tick_us = now;
@@ -1363,6 +2040,39 @@ void control_surfaces_tick(void) {
                                          op))
                 op->shadow_active = false;
         }
+    }
+
+    // Grouped ops: retry BUSY members and age out gesture sessions (REL /
+    // ADJ / ABS; momentary holds never age).
+    for (uint8_t s = 0; s < CS_MAX_BINDINGS; s++) {
+        CsGroupOp *gop = &s_gop[s];
+        if (!s_rt[s].active || gop->mode == CS_GOP_IDLE) continue;
+        const CsBinding *b = &s_cfg.bindings[s];
+        if (gop->pend_mask) cs_gop_pump(b, gop);
+        if (gop->mode != CS_GOP_MOM_ENGAGE && gop->mode != CS_GOP_MOM_RESTORE &&
+            gop->age < 0xFFFF && ++gop->age >= CS_GROUP_SESSION_TICKS &&
+            gop->pend_mask == 0)
+            gop->mode = CS_GOP_IDLE;
+    }
+
+    // Macro sequencer: retry its op contexts (with the same session aging),
+    // then advance the sequence.
+    if (s_macro_run != 0xFF) {
+        const CsMacroStep *ms = &s_macros.macros[s_macro_run].steps[s_macro_step];
+        CsBinding v = cs_macro_step_view(ms);
+        if (s_macro_op.pending &&
+            cs_noun_dispatch(v.noun, v.target, v.index, s_macro_op.value))
+            s_macro_op.pending = false;
+        if (s_macro_op.shadow_active &&
+            ++s_macro_op.shadow_age >= CS_SHADOW_TIMEOUT_TICKS)
+            s_macro_op.shadow_active = false;
+        if (s_macro_gop.pend_mask) cs_gop_pump(&v, &s_macro_gop);
+        if (s_macro_gop.mode != CS_GOP_IDLE &&
+            s_macro_gop.age < 0xFFFF &&
+            ++s_macro_gop.age >= CS_GROUP_SESSION_TICKS &&
+            s_macro_gop.pend_mask == 0)
+            s_macro_gop.mode = CS_GOP_IDLE;
+        cs_tick_macro();
     }
 
     // Same retry / shadow maintenance for the IR commands' op states.
@@ -1436,6 +2146,30 @@ const CsBinding *control_surfaces_get_binding(uint8_t slot) {
 
 const IrCommand *control_surfaces_get_ir_cmd(uint8_t sub) {
     return (sub < CS_MAX_IR_COMMANDS) ? &s_ir.cmds[sub] : NULL;
+}
+
+const CsGroupConfig *control_surfaces_group_config(void) { return &s_groups; }
+
+const CsMacroConfig *control_surfaces_macro_config(void) { return &s_macros; }
+
+const CsGroup *control_surfaces_get_group(uint8_t idx) {
+    return (idx < CS_MAX_GROUPS) ? &s_groups.groups[idx] : NULL;
+}
+
+const CsMacro *control_surfaces_get_macro(uint8_t idx) {
+    return (idx < CS_MAX_MACROS) ? &s_macros.macros[idx] : NULL;
+}
+
+void control_surfaces_get_ext_status(CsExtStatusPacket *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    out->max_groups = CS_MAX_GROUPS;
+    out->max_macros = CS_MAX_MACROS;
+    out->max_macro_steps = CS_MAX_MACRO_STEPS;
+    out->macro_running = s_macro_run;
+    out->macro_step = (s_macro_run != 0xFF) ? s_macro_step : 0;
+    memcpy(out->group_status, s_group_status, sizeof(out->group_status));
+    memcpy(out->macro_status, s_macro_status, sizeof(out->macro_status));
 }
 
 void control_surfaces_get_status(CsStatusPacket *out) {

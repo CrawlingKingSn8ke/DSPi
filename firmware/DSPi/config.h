@@ -128,6 +128,22 @@ extern volatile uint32_t nominal_feedback_10_14;
 // tud_vendor_control_xfer_cb in vendor_commands.c.
 #define MS_VENDOR_CODE      0x01
 
+// Control Surfaces target groups and macros (caps v9); see control_surfaces.h
+// and Documentation/Features/control_surfaces_groups_macros_spec.md.  The rest
+// of 0x00-0x1F stays unallocated; 0x01 is MS_VENDOR_CODE above, intercepted in
+// tud_vendor_control_xfer_cb before the application dispatcher sees it.
+#define REQ_SET_CS_GROUP            0x20  // wValue = group (0-7), payload = 40-byte CsGroup;
+                                          // all-zero record clears the slot
+#define REQ_GET_CS_GROUP            0x21  // wValue = group (0-7); returns 40-byte CsGroup
+#define REQ_SET_CS_MACRO            0x22  // wValue = macro (0-7), payload = 36-byte
+                                          // CsMacroHeaderWire (name + step_count)
+#define REQ_GET_CS_MACRO            0x23  // wValue = macro (0-7); returns 132-byte CsMacro
+#define REQ_SET_CS_MACRO_STEP       0x24  // wValue = (step << 8) | macro, payload = 12-byte
+                                          // CsMacroStep; all-zero record clears the step
+#define REQ_CS_MACRO_FIRE           0x25  // GET; wValue = macro fires it, 0xFFFF cancels the
+                                          // running one; returns 1 status byte
+#define REQ_GET_CS_EXT_STATUS       0x26  // returns 24-byte CsExtStatusPacket
+
 // Psychoacoustic bass enhancement (missing-fundamental harmonics; psybass.h)
 #define REQ_SET_PSYBASS             0x30
 #define REQ_GET_PSYBASS             0x31

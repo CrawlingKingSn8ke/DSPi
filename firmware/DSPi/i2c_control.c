@@ -11,6 +11,7 @@
 #include "vendor_commands.h"
 #include "usb_audio.h"
 #include "bulk_params.h"
+#include "control_surfaces.h"   // CsMacro sizes resp_small
 
 #include <string.h>
 #include "pico/stdlib.h"
@@ -48,7 +49,9 @@ static volatile bool     frame_ready;       // complete frame awaiting dispatch
 
 // --- parked response (written by poll, drained by ISR) ---
 static uint8_t  resp_hdr[I2C_CTRL_RESP_HDR_LEN];
-static uint8_t  resp_small[64];             // copy of non-bulk GET payloads
+// Sized with _ext_resp_copy and the UART TX_COPY_MAX for the largest
+// non-bulk GET (the 132-byte CsMacro); the three must move together.
+static uint8_t  resp_small[sizeof(CsMacro)];   // copy of non-bulk GET payloads
 static const uint8_t *resp_payload;         // resp_small or bulk_param_buf
 static volatile uint16_t resp_len;
 static volatile bool     resp_ready;

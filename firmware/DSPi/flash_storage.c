@@ -584,6 +584,11 @@ typedef struct __attribute__((packed)) {
 // last directory member, so every earlier field keeps its offset; pre-V17
 // migrations read the old block through CsIrConfig_v1 and widen it with
 // cs_ir_from_v1(), leaving sub-slots 8..15 empty.
+//
+// V18 appends the Control Surfaces target groups and macros (CsGroupConfig then
+// CsMacroConfig): board-level beside cs_config for the same reason, all-zero =
+// no groups and no macros, so a fresh directory needs no seeding.  Every earlier
+// field keeps its offset, making the V17->V18 migration a prefix copy.
 typedef struct __attribute__((packed)) {
     uint32_t magic;                          // DIR_MAGIC
     uint16_t version;                        // Directory format version (4)
@@ -636,6 +641,11 @@ typedef struct __attribute__((packed)) {
     // cs_config; all-zero = every sub-slot empty (feature idle).  V17 grew this
     // from 132 to 260 bytes (config format v2: 16 sub-slots).
     CsIrConfig cs_ir;                        // 260 bytes
+
+    // V18 addition: Control Surfaces target groups and macros.  Board-level /
+    // device-global like cs_config; all-zero = no groups, no macros.
+    CsGroupConfig cs_groups;                 // 324 bytes
+    CsMacroConfig cs_macros;                 // 1060 bytes
 } PresetDirectory;
 
 // Historical directory layout at V4, where output_config was the 20-byte
@@ -970,6 +980,35 @@ typedef struct __attribute__((packed)) {
     CsIrConfig_v1 cs_ir;                     // 132 bytes (frozen format v1)
 } PresetDirectory_v16;
 
+// --- Preset Directory v17 (kept only for upgrade migration) ---
+// Identical to the live layout except it lacks the trailing cs_groups /
+// cs_macros blocks.  The embedded types are still the live ones only because
+// nothing has grown them since V17; the size assert below pins that, and
+// growing any of them means snapshotting a _v17 variant here first.
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;                        // == 17
+    uint16_t reserved;
+    uint32_t crc32;
+
+    uint8_t  startup_mode;
+    uint8_t  default_slot;
+    uint8_t  last_active_slot;
+    uint8_t  output_config_mode;
+    uint16_t slot_occupied;
+    uint8_t  master_volume_mode;
+    uint8_t  spdif_rx_pin;
+    float    master_volume_db;
+    char     slot_names[PRESET_SLOTS][PRESET_NAME_LEN];
+    DacHwMuteConfig dac_hw_mute;
+    FlashOutputConfig output_config;         // 35 bytes (current layout)
+    UartCtrlConfig uart_ctrl;
+    I2cCtrlConfig  i2c_ctrl;
+    CsFlashConfig cs_config;                 // 388 bytes (current format v2)
+    char cs_names[CS_MAX_BINDINGS][CS_NAME_LEN];  // 512 bytes
+    CsIrConfig cs_ir;                        // 260 bytes (current format v2)
+} PresetDirectory_v17;
+
 // The V16->V17 migration copies everything ahead of cs_ir with one memcpy, so
 // the two layouts must agree byte-for-byte up to that point.
 _Static_assert(offsetof(PresetDirectory_v16, cs_ir) == offsetof(PresetDirectory, cs_ir),
@@ -979,7 +1018,15 @@ _Static_assert(offsetof(PresetDirectory_v16, cs_ir) == offsetof(PresetDirectory,
 _Static_assert(sizeof(PresetDirectory_v16) == 1443,
                "V16 directory geometry is frozen; snapshot any struct that grew");
 
-#define DIR_VERSION_CURRENT  17
+// V18 only appends, so the V17->V18 migration copies the whole V17 data block
+// as one prefix; cs_ir must therefore still start at the same offset.
+_Static_assert(offsetof(PresetDirectory_v17, cs_ir) == offsetof(PresetDirectory, cs_ir),
+               "V17 and V18 directories must share a byte-identical pre-cs_ir prefix");
+// Pins the on-flash V17 geometry, which the offset check above cannot.
+_Static_assert(sizeof(PresetDirectory_v17) == 1571,
+               "V17 directory geometry is frozen; snapshot any struct that grew");
+
+#define DIR_VERSION_CURRENT  18
 
 // The directory occupies exactly one flash sector; growth past it would
 // silently overrun into preset slot 0.
@@ -1272,6 +1319,8 @@ static void ctrl_iface_defaults(UartCtrlConfig *u, I2cCtrlConfig *i);  // define
 static void dir_sanitize_ctrl_iface(void);                            // defined below
 static void dir_sanitize_cs_config(void);                             // defined below
 static void dir_sanitize_cs_ir(void);                                 // defined below
+static void dir_sanitize_cs_groups(void);                             // defined below
+static void dir_sanitize_cs_macros(void);                             // defined below
 static void cs_config_from_v1(CsFlashConfig *dst, const CsFlashConfig_v1 *src);  // defined below
 static void cs_ir_from_v1(CsIrConfig *dst, const CsIrConfig_v1 *src);            // defined below
 // Forward declaration — defined alongside validate_slot() in the SLOT
@@ -1544,7 +1593,35 @@ static bool dir_load_cache(void) {
         dir_sanitize_ctrl_iface();
         dir_sanitize_cs_config();
         dir_sanitize_cs_ir();
+        dir_sanitize_cs_groups();
+        dir_sanitize_cs_macros();
         dir_cache_valid = true;
+        return true;
+    }
+
+    if (flash_dir->version == 17) {
+        // V17 -> V18 migration.  V18 appends the Control Surfaces group and
+        // macro tables; everything before them is byte-identical, so copy the
+        // whole V17 data block and leave the new blobs zeroed (no groups, no
+        // macros).
+        const PresetDirectory_v17 *v17 = (const PresetDirectory_v17 *)flash_dir;
+        const uint8_t *v17_data_start = (const uint8_t *)&v17->startup_mode;
+        size_t v17_data_len = sizeof(PresetDirectory_v17) - offsetof(PresetDirectory_v17, startup_mode);
+        if (crc32(v17_data_start, v17_data_len) != v17->crc32) {
+            dir_cache_valid = false;
+            return false;
+        }
+        memset(&dir_cache, 0, sizeof(dir_cache));
+        // Header excluded: dir_flush() restamps magic/version/crc, and copying
+        // the old one would leave the cache reading V17 until it does.
+        memcpy(&dir_cache.startup_mode, v17_data_start, v17_data_len);
+        dir_sanitize_ctrl_iface();
+        dir_sanitize_cs_config();
+        dir_sanitize_cs_ir();
+        dir_sanitize_cs_groups();
+        dir_sanitize_cs_macros();
+        dir_cache_valid = true;
+        (void)dir_flush();   // persist at the current version
         return true;
     }
 
@@ -1570,6 +1647,8 @@ static bool dir_load_cache(void) {
         dir_sanitize_ctrl_iface();
         dir_sanitize_cs_config();
         dir_sanitize_cs_ir();
+        dir_sanitize_cs_groups();
+        dir_sanitize_cs_macros();
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
         return true;
@@ -1608,6 +1687,8 @@ static bool dir_load_cache(void) {
         dir_sanitize_ctrl_iface();
         dir_sanitize_cs_config();
         dir_sanitize_cs_ir();
+        dir_sanitize_cs_groups();
+        dir_sanitize_cs_macros();
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
         return true;
@@ -1648,6 +1729,8 @@ static bool dir_load_cache(void) {
         dir_sanitize_ctrl_iface();
         dir_sanitize_cs_config();
         dir_sanitize_cs_ir();
+        dir_sanitize_cs_groups();
+        dir_sanitize_cs_macros();
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
         return true;
@@ -1687,6 +1770,8 @@ static bool dir_load_cache(void) {
         dir_sanitize_ctrl_iface();
         dir_sanitize_cs_config();
         dir_sanitize_cs_ir();
+        dir_sanitize_cs_groups();
+        dir_sanitize_cs_macros();
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
         return true;
@@ -1727,6 +1812,8 @@ static bool dir_load_cache(void) {
         dir_sanitize_ctrl_iface();
         dir_sanitize_cs_config();
         dir_sanitize_cs_ir();
+        dir_sanitize_cs_groups();
+        dir_sanitize_cs_macros();
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
         return true;
@@ -1766,6 +1853,8 @@ static bool dir_load_cache(void) {
         dir_sanitize_ctrl_iface();
         dir_sanitize_cs_config();
         dir_sanitize_cs_ir();
+        dir_sanitize_cs_groups();
+        dir_sanitize_cs_macros();
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
         return true;
@@ -1805,6 +1894,8 @@ static bool dir_load_cache(void) {
         dir_sanitize_ctrl_iface();
         dir_sanitize_cs_config();
         dir_sanitize_cs_ir();
+        dir_sanitize_cs_groups();
+        dir_sanitize_cs_macros();
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
         return true;
@@ -1842,6 +1933,8 @@ static bool dir_load_cache(void) {
         dir_sanitize_ctrl_iface();
         dir_sanitize_cs_config();
         dir_sanitize_cs_ir();
+        dir_sanitize_cs_groups();
+        dir_sanitize_cs_macros();
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
         return true;
@@ -2284,6 +2377,58 @@ static void dir_sanitize_cs_ir(void) {
     // Normalize the version byte; a fresh/migrated all-zero block leaves it 0
     // (still idle, every sub-slot empty).
     c->version = CS_IR_CONFIG_VERSION;
+}
+
+// Bound-check the directory's Control Surfaces group table.  An implausible blob
+// version (or a dirty reserved field) resets the whole block; an implausible
+// group resets that slot.  member_mask is deliberately not range-checked here:
+// the channel count is platform-dependent, so control_surfaces.c validates it at
+// apply time.  Mirrors dir_sanitize_cs_ir.
+static void dir_sanitize_cs_groups(void) {
+    CsGroupConfig *c = &dir_cache.cs_groups;
+    if (c->version > CS_GROUP_CONFIG_VERSION ||
+        c->reserved[0] || c->reserved[1] || c->reserved[2]) {
+        memset(c, 0, sizeof(*c));
+        c->version = CS_GROUP_CONFIG_VERSION;
+        return;
+    }
+    for (int g = 0; g < CS_MAX_GROUPS; g++) {
+        CsGroup *grp = &c->groups[g];
+        // target_kind 0 marks the slot empty; anything past the channel-space
+        // enum, or a dirty reserved field, means the record is not ours.
+        if (grp->target_kind > CS_TARGET_DSP_CH ||
+            grp->reserved[0] || grp->reserved[1] || grp->reserved[2]) {
+            memset(grp, 0, sizeof(*grp));
+        }
+        // Guarantee NUL termination so hand-edited flash can never leak an
+        // unterminated string to REQ_GET_CS_GROUP readers.
+        grp->name[CS_NAME_LEN - 1] = '\0';
+    }
+    // Normalize the version byte; a fresh/migrated all-zero block leaves it 0
+    // (still idle, every group empty).
+    c->version = CS_GROUP_CONFIG_VERSION;
+}
+
+// Bound-check the directory's Control Surfaces macro table.  An implausible blob
+// version (or a dirty reserved field) resets the whole block; per macro the step
+// count is clamped so the sequencer can never run past steps[].  Per-step
+// validation runs at fire time in control_surfaces.c.
+static void dir_sanitize_cs_macros(void) {
+    CsMacroConfig *c = &dir_cache.cs_macros;
+    if (c->version > CS_MACRO_CONFIG_VERSION ||
+        c->reserved[0] || c->reserved[1] || c->reserved[2]) {
+        memset(c, 0, sizeof(*c));
+        c->version = CS_MACRO_CONFIG_VERSION;
+        return;
+    }
+    for (int m = 0; m < CS_MAX_MACROS; m++) {
+        CsMacro *mac = &c->macros[m];
+        if (mac->step_count > CS_MAX_MACRO_STEPS) mac->step_count = CS_MAX_MACRO_STEPS;
+        mac->name[CS_NAME_LEN - 1] = '\0';
+    }
+    // Normalize the version byte; a fresh/migrated all-zero block leaves it 0
+    // (still idle, every macro empty).
+    c->version = CS_MACRO_CONFIG_VERSION;
 }
 
 // Write the RAM-cached directory back to flash.
@@ -3833,17 +3978,40 @@ void preset_get_cs_ir_config(CsIrConfig *out) {
     memcpy(out, &dir_cache.cs_ir, sizeof(*out));
 }
 
+// Control Surfaces group and macro tables (V18).  Getters read the RAM cache;
+// both persist through preset_set_cs_all below.
+void preset_get_cs_groups(CsGroupConfig *out) {
+    if (!out) return;
+    dir_ensure();
+    memcpy(out, &dir_cache.cs_groups, sizeof(*out));
+}
+
+void preset_get_cs_macros(CsMacroConfig *out) {
+    if (!out) return;
+    dir_ensure();
+    memcpy(out, &dir_cache.cs_macros, sizeof(*out));
+}
+
 uint8_t preset_set_cs_all(const CsFlashConfig *cfg, const CsIrConfig *ir,
-                          const char (*names)[CS_NAME_LEN]) {
-    if (!cfg || !ir || !names) return PRESET_ERR_INVALID_SLOT;
+                          const char (*names)[CS_NAME_LEN],
+                          const CsGroupConfig *groups, const CsMacroConfig *macros) {
+    if (!cfg || !ir || !names || !groups || !macros) return PRESET_ERR_INVALID_SLOT;
     dir_ensure();
     memcpy(&dir_cache.cs_config, cfg, sizeof(dir_cache.cs_config));
     dir_cache.cs_config.version = CS_CONFIG_VERSION;
     memcpy(&dir_cache.cs_ir, ir, sizeof(dir_cache.cs_ir));
     dir_cache.cs_ir.version = CS_IR_CONFIG_VERSION;
+    memcpy(&dir_cache.cs_groups, groups, sizeof(dir_cache.cs_groups));
+    dir_cache.cs_groups.version = CS_GROUP_CONFIG_VERSION;
+    memcpy(&dir_cache.cs_macros, macros, sizeof(dir_cache.cs_macros));
+    dir_cache.cs_macros.version = CS_MACRO_CONFIG_VERSION;
     memcpy(dir_cache.cs_names, names, sizeof(dir_cache.cs_names));
     for (uint8_t s = 0; s < CS_MAX_BINDINGS; s++)
         dir_cache.cs_names[s][CS_NAME_LEN - 1] = '\0';
+    for (uint8_t g = 0; g < CS_MAX_GROUPS; g++)
+        dir_cache.cs_groups.groups[g].name[CS_NAME_LEN - 1] = '\0';
+    for (uint8_t m = 0; m < CS_MAX_MACROS; m++)
+        dir_cache.cs_macros.macros[m].name[CS_NAME_LEN - 1] = '\0';
     if (dir_flush() != 0) {
         return PRESET_ERR_FLASH_WRITE;
     }

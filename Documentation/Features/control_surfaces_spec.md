@@ -1,15 +1,17 @@
 # Control Surfaces (User-Wired Physical Controls and Indicators)
 
-*Firmware capability format version: 7*
+*Firmware capability format version: 9*
 *Config (flash) version: 2; IR config version: 2*
-*Directory version: 17*
+*Directory version: 18*
 
 This document is the complete, self-contained specification for the DSPi
 Control Surfaces feature: user-wired push buttons, toggle switches,
 potentiometers, quadrature rotary encoders, indicator LEDs, PWM-dimmed
 LEDs, and an IR remote receiver on spare GPIOs, configured over vendor
 commands `0x84`-`0x87`, `0x8B`/`0x8C` (per-slot names), `0x8D`-`0x8F`
-(IR remote commands and learn), and `0x9D`/`0x9E` (save / revert). It is
+(IR remote commands and learn), and `0x9D`/`0x9E` (save / revert). The caps v9
+target-group and macro commands `0x20`-`0x26` are specified in the companion
+document `control_surfaces_groups_macros_spec.md`. It is
 written for a host-app developer (e.g. DSPi Console) or an LLM adding Control
 Surfaces support to an app, or extending the firmware feature itself. No DSPi
 source is required to implement a host client.
@@ -49,6 +51,15 @@ struct still 24 bytes), legal only on LED types with `IND_EQUALS`/`IND_ABOVE`
 dB, the loudest channel of the active input), for signal-presence sensing
 such as amplifier trigger outputs. Pre-v8 configs carry zeros in the new
 fields, which means no delay; nothing else changes.
+
+Caps v9 adds target groups (8 named channel sets a binding addresses as a unit
+via `CS_FLAG_GROUP`) and macros (8 sequences of up to 8 steps, fired through
+the appended noun 52, `CS_NOUN_MACRO`), commands `0x20`-`0x26`, and directory
+V18. `CsBinding`, `IrCommand` and `CsStatusPacket` are byte-identical to v8;
+the caps header's three bytes after `max_ir_commands` become
+`max_groups`/`max_macros`/`max_macro_steps`. The authority for all of it,
+including every new struct and status code, is
+`control_surfaces_groups_macros_spec.md`.
 
 Writing style note: this doc avoids em-dashes per project convention.
 
@@ -367,6 +378,10 @@ and is not part of `WireBulkParams`.
 ---
 
 ## 3. Command reference (`0x84`-`0x87`, `0x8B`-`0x8F`, `0x9D`-`0x9E`)
+
+The caps v9 group and macro commands `0x20`-`0x26` follow the same conventions
+but are documented in `control_surfaces_groups_macros_spec.md`; `REQ_CS_SAVE`
+and `REQ_CS_REVERT` below cover their config too.
 
 | Command | Code | Dir | wValue | wLength / payload | Response |
 |---------|------|-----|--------|-------------------|----------|

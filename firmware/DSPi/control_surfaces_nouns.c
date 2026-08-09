@@ -234,6 +234,11 @@ const CsNounDesc cs_noun_table[CS_NOUN_COUNT] = {
     [CS_NOUN_INPUT_LEVEL_MAX] = { CS_KIND_CONTINUOUS, 0, CS_CONT_RO,
                                   Q8(-60), 0, CS_UNIT_DB,
                                   CS_TARGET_NONE, 0, 0 },
+    // SET fires macro `value`; IND_EQUALS lights while it runs.  Stepping
+    // through macros would fire them while browsing, so INC/DEC stay out.
+    [CS_NOUN_MACRO]           = { CS_KIND_ENUM, CS_MAX_MACROS,
+                                  CS_ACT_BIT(CS_ACT_SET) | CS_ACT_BIT(CS_ACT_IND_EQUALS),
+                                  0, 0, CS_UNIT_NONE, CS_TARGET_NONE, 0, 0 },
 };
 
 // ---------------------------------------------------------------------------
@@ -399,6 +404,8 @@ float cs_noun_get(uint8_t noun, uint8_t target, uint8_t index) {
         // only the table rebuild is deferred to the main loop.
         case CS_NOUN_LOUDNESS_SPL:       return loudness_ref_spl;
         case CS_NOUN_LOUDNESS_INTENSITY: return loudness_intensity_pct;
+        // 255 while idle so an IND_EQUALS comparand never matches.
+        case CS_NOUN_MACRO:              return (float)cs_macro_running_index();
         default: return 0.0f;
     }
 }
@@ -512,6 +519,11 @@ bool cs_noun_dispatch(uint8_t noun, uint8_t target, uint8_t index, float value) 
                                     (value >= 0.5f) ? SIGGEN_CTL_START : SIGGEN_CTL_STOP,
                                     0, 1, &rd, &rl);
             break;
+        case CS_NOUN_MACRO:
+            // Direct call, not a vendor command: the sequencer itself then
+            // dispatches every step through the shared command surface.
+            (void)control_surfaces_macro_fire((uint8_t)value);
+            return true;
         case CS_NOUN_DAC_MUTE_TEST:
             r = vendor_dispatch_get(CTRL_SOURCE_GPIO, REQ_TEST_DAC_HW_MUTE,
                                     0, 0, 1, &rd, &rl);
@@ -554,35 +566,43 @@ bool cs_noun_dispatch(uint8_t noun, uint8_t target, uint8_t index, float value) 
 // Target validation
 // ---------------------------------------------------------------------------
 
-uint8_t cs_noun_validate_target(const CsBinding *b) {
-    const CsNounDesc *nd = &cs_noun_table[b->noun];
+// One resolved channel (+ band for DSP_BAND nouns); the per-member check
+// behind grouped bindings and the core of the single-target check below.
+uint8_t cs_noun_validate_target_ch(uint8_t noun, uint8_t ch, uint8_t index) {
+    const CsNounDesc *nd = &cs_noun_table[noun];
     switch (nd->target_kind) {
-        case CS_TARGET_NONE:
-            // Strict: untargeted nouns must carry zeros so a host bug is
-            // caught at bind time, not silently ignored.
-            if (b->target != 0 || b->index != 0) return CS_STATUS_INVALID_TARGET;
-            return PIN_CONFIG_SUCCESS;
         case CS_TARGET_INPUT_CH:
         case CS_TARGET_OUTPUT_CH:
         case CS_TARGET_DSP_CH:
-            if (b->target >= nd->target_count || b->index != 0)
+            if (ch >= nd->target_count || index != 0)
                 return CS_STATUS_INVALID_TARGET;
             return PIN_CONFIG_SUCCESS;
         case CS_TARGET_DSP_BAND: {
-            if (b->target >= nd->target_count) return CS_STATUS_INVALID_TARGET;
-            bool peq = (b->index < channel_band_counts[b->target]);
+            if (ch >= nd->target_count) return CS_STATUS_INVALID_TARGET;
+            bool peq = (index < channel_band_counts[ch]);
             // Crossover bands exist on output channels only; the EQ handler
             // rejects them on inputs, so reject at bind time too.
-            bool xover = (b->index >= XOVER_BAND_BASE &&
-                          b->index < XOVER_BAND_BASE + MAX_XOVER_BANDS &&
-                          b->target >= CH_OUT_1);
+            bool xover = (index >= XOVER_BAND_BASE &&
+                          index < XOVER_BAND_BASE + MAX_XOVER_BANDS &&
+                          ch >= CH_OUT_1);
             // Gain/Q/type only exist on PEQ bands; frequency and bypass also
             // apply to the crossover bands (a sub-crossover knob).
-            if (b->noun == CS_NOUN_FILTER_FREQ || b->noun == CS_NOUN_FILTER_BYPASS)
+            if (noun == CS_NOUN_FILTER_FREQ || noun == CS_NOUN_FILTER_BYPASS)
                 return (peq || xover) ? PIN_CONFIG_SUCCESS : CS_STATUS_INVALID_TARGET;
             return peq ? PIN_CONFIG_SUCCESS : CS_STATUS_INVALID_TARGET;
         }
         default:
             return CS_STATUS_INVALID_TARGET;
     }
+}
+
+uint8_t cs_noun_validate_target(const CsBinding *b) {
+    const CsNounDesc *nd = &cs_noun_table[b->noun];
+    if (nd->target_kind == CS_TARGET_NONE) {
+        // Strict: untargeted nouns must carry zeros so a host bug is
+        // caught at bind time, not silently ignored.
+        if (b->target != 0 || b->index != 0) return CS_STATUS_INVALID_TARGET;
+        return PIN_CONFIG_SUCCESS;
+    }
+    return cs_noun_validate_target_ch(b->noun, b->target, b->index);
 }

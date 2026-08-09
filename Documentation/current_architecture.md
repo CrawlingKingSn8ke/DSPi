@@ -1445,10 +1445,10 @@ Last 12 sectors (48 KB) of flash:
 | 1-10 | -44 KB to -8 KB | `0x44535033` ("DSP3") | Preset Slots 0-9 (full DSP state) |
 | 11 | -4 KB | `0x44535031` ("DSP1") | Legacy sector (migration source) |
 
-### Preset Directory Fields (Version 17)
-*Last updated: 2026-08-04 (V17 doubles the Control Surfaces IR command table to 16 sub-slots)*
+### Preset Directory Fields (Version 18)
+*Last updated: 2026-08-09 (V18 appends the Control Surfaces target-group and macro tables)*
 
-`DIR_VERSION_CURRENT` = 17. V4 renamed the former `include_pins` byte to
+`DIR_VERSION_CURRENT` = 18. V4 renamed the former `include_pins` byte to
 `output_config_mode` (same offset, 1:1 value mapping) and appended the
 device-global `FlashOutputConfig` block. V5 grew that block by 3 bytes for the
 I2S multichannel input pins (`i2s_rx_pin_ext[3]`). V6 appends the device-level
@@ -1503,8 +1503,18 @@ that the two prefixes match), and widens the block via `cs_ir_from_v1()`, which
 carries the 8 learned commands over verbatim and leaves sub-slots 8-15 empty.
 Every pre-V17 migration reads the old block through the frozen `CsIrConfig_v1`
 and widens it the same way. This growth makes
-`sizeof(PresetDirectory)` 1571 bytes (1443 at V16, 1433 at V11), still within
-the single 4 KB directory sector. See
+`sizeof(PresetDirectory)` 1571 bytes at V17 (1443 at V16, 1433 at V11). V18
+appends the Control Surfaces target-group table (324-byte `CsGroupConfig`) then
+the macro table (1060-byte `CsMacroConfig`) after `cs_ir`, both device-global
+beside the rest of the CS config, taking `sizeof(PresetDirectory)` to 2955
+bytes; still within the single 4 KB directory sector. The V17 layout is
+byte-identical to the V18 prefix (frozen `PresetDirectory_v17` snapshot plus
+`_Static_assert`s pinning the geometry), so the V17->V18 step is a prefix copy
+with the two new blobs zero-filled, which means "no groups, no macros";
+`dir_sanitize_cs_groups()` and `dir_sanitize_cs_macros()` bound-check the
+blob versions, `target_kind` and `step_count` on every load and zero
+implausible entries (`member_mask` range and step records are
+platform-dependent, so they validate at apply / fire time instead). See
 `Documentation/Features/output_config_independent_load.md`,
 `Documentation/Features/control_interfaces_spec.md`, and
 `Documentation/Features/control_surfaces_spec.md`.
@@ -1527,6 +1537,8 @@ the single 4 KB directory sector. See
 | cs_config | Control Surfaces bindings (V7 format v1 = 132 B / 8x 16-byte; V9 format v2 = 388-byte `CsFlashConfig`: version + 16x 24-byte `CsBinding`; all-zero = idle; board-level, survives factory reset) |
 | cs_names[16][32] | Per-slot Control Surfaces names (V10+): 32-byte NUL-terminated user labels, independent of the bindings; all-zero = unnamed; board-level, survives factory reset |
 | cs_ir | Control Surfaces IR command table (V11 format v1 = 132 B / 8x 16-byte; V17 format v2 = 260-byte `CsIrConfig`: version + 16x 16-byte `IrCommand`; all-zero = every sub-slot empty = idle; board-level, survives factory reset) |
+| cs_groups | Control Surfaces target groups (V18+, 324-byte `CsGroupConfig`: version + 8x 40-byte `CsGroup`; all-zero = no groups; board-level, survives factory reset) |
+| cs_macros | Control Surfaces macros (V18+, 1060-byte `CsMacroConfig`: version + 8x 132-byte `CsMacro`, each 32-byte name + step count + 8x 12-byte `CsMacroStep`; all-zero = no macros; board-level, survives factory reset) |
 
 ### Preset Slot Data (Version 12)
 *Last updated: 2026-07-19 (upmixer presence byte, slot V34; `SLOT_DATA_VERSION` now 34)*
@@ -1907,7 +1919,7 @@ masked, and PDM claims its channel once at init.
 ---
 
 ## Memory Layout
-*Last updated: 2026-08-06 (input capture arena overlays the SPDIF/I2S/ADAT capture buffers: -20,480 B BSS on RP2350, -4,092 B on RP2040; RP2350 .data +5,256 B for the fused SVF pair arms)*
+*Last updated: 2026-08-09 (Control Surfaces groups/macros: +~4.3 KB BSS RP2350, +~3.6 KB RP2040; preset directory now 2955 B at V18)*
 
 > **Input capture arena (2026-08-06).** The `pico_spdif_rx` FIFO (12 KB), the I2S
 > RX rings (4 KB RP2040 / 32 KB RP2350) and the ADAT RX ring (8 KB, RP2350 only)
@@ -2075,6 +2087,14 @@ and warns on flash reached through linker long-call veneers (cold paths); Check
 > `sizeof(PresetDirectory)` is now 1301 bytes (789 at V9, ~533 before), still
 > well within its 4 KB sector, so the flash layout is unchanged. The name
 > block also grows the BSS `dir_cache` mirror by 512 bytes on both platforms.
+>
+> **Groups and macros (2026-08-09, caps v9).** Roughly 4.3 KB more BSS on
+> RP2350 and 3.6 KB on RP2040: the live `CsGroupConfig` + `CsMacroConfig`
+> (1,384 B), the same again in the `dir_cache` mirror, and 17 `CsGroupOp`
+> contexts (one per binding slot plus the macro sequencer) whose
+> `base[NUM_CHANNELS]` capture array makes each ~92 B on RP2350 and ~52 B on
+> RP2040. The preset directory grows by the same 1,384 bytes to 2955 of its
+> 4 KB sector at V18, so the flash layout is again unchanged.
 
 ### RP2040 (264 KB SRAM)
 
@@ -2250,7 +2270,7 @@ Atomic read-then-clear: returns the current `clip_flags` value (2 bytes, little-
 ---
 
 ## External Control Interfaces (UART / I2C Target)
-*Last updated: 2026-07-04*
+*Last updated: 2026-08-09 (`_ext_resp_copy` widened to 132 bytes for the Control Surfaces macro GET)*
 
 An external microcontroller can drive the entire vendor-command surface over a
 UART or the I2C target (slave) interface, at parity with USB. Full integrator
@@ -2273,7 +2293,12 @@ per-transport to implement.
 **Response sink.** A GET dispatch returns a pointer/length into static storage
 that stays valid until the next dispatch from any transport, so a transport poll
 consumes or copies it before returning. `REQ_GET_ALL_PARAMS` points into
-`bulk_param_buf` and holds the bulk lock until the caller releases it.
+`bulk_param_buf` and holds the bulk lock until the caller releases it. Every
+other GET is copied into the static `_ext_resp_copy` sink while the handler
+frame is still alive, because an external transport consumes the bytes only
+after the handler returns. That sink is sized by the largest non-bulk GET, so
+it widened from 64 to 132 bytes for `REQ_GET_CS_MACRO`'s `CsMacro`; a longer
+response than that would have to go through the bulk buffer path.
 
 **USB SET-in-flight guard.** External dispatch runs from the main loop and is
 refused with `CTRL_DISPATCH_BUSY` (wire `CTRL_STATUS_BUSY`) while a USB control
@@ -2361,16 +2386,18 @@ format version is unchanged by this feature.
 ---
 
 ## Control Surfaces (User-Wired Physical Controls)
-*Last updated: 2026-08-09 (caps v8: indicator on/off delays + INPUT_LEVEL_MAX noun)*
+*Last updated: 2026-08-09 (caps v9: target groups and macros, commands 0x20-0x26, directory V18)*
 
 User-wired push buttons, toggle switches, potentiometers, quadrature rotary
 encoders, plain indicator LEDs, PWM-dimmed LEDs, and an IR remote receiver on
 spare GPIOs, configured over vendor commands `0x84`-`0x87`, `0x8B`/`0x8C`
-(per-slot names), `0x8D`-`0x8F` (IR commands and learn), and `0x9D`/`0x9E`
-(save/revert). A binding attaches one component (`CsType`)
+(per-slot names), `0x8D`-`0x8F` (IR commands and learn), `0x9D`/`0x9E`
+(save/revert), and `0x20`-`0x26` (target groups and macros). A binding attaches
+one component (`CsType`)
 to one firmware parameter (`CsNoun`) through one operation (`CsAction`), on one
 or two GPIOs. The full integrator spec is
-`Documentation/Features/control_surfaces_spec.md`.
+`Documentation/Features/control_surfaces_spec.md`, with groups and macros
+specified in `Documentation/Features/control_surfaces_groups_macros_spec.md`.
 
 **Format v2** (`CS_CONFIG_VERSION` = 2, `caps_version` = 2) supersedes the
 original v1 model. Bindings grew from 16 to 24 bytes and gained explicit
@@ -2462,6 +2489,15 @@ signal presence. The motivating combination is an amplifier trigger output:
 a plain LED binding with `INPUT_LEVEL_MAX` + `IND_ABOVE` + an `off_delay` of
 minutes drives an amp's 12 V trigger on at the first signal and off only
 after sustained silence (spec section 8.2g).
+
+**Caps v9** (2026-08-09) adds target groups and macros (subsection below),
+commands `0x20`-`0x26`, and directory V18. `CsBinding`, `IrCommand` and
+`CsStatusPacket` are byte-identical to caps v8, so external clients doing
+exact-length readback are unaffected until they opt into the new commands;
+`CsCapsHeader` keeps its 40 bytes with the three reserved bytes after
+`max_ir_commands` becoming `max_groups` / `max_macros` / `max_macro_steps` (a
+pre-v9 host read them as zeros). One noun is appended, `CS_NOUN_MACRO` (52),
+taking `noun_count` to 53.
 
 ### File layout
 
@@ -2647,6 +2683,101 @@ live name (`control_surfaces_get_name`; the unsaved preview while dirty). A
 payload of one NUL byte clears the name; names are not part of
 `WireBulkParams` and emit no notification.
 
+### Target groups and macros (caps v9, 0x20-0x26)
+
+Wire detail (every struct, status code and command payload) is in
+`Documentation/Features/control_surfaces_groups_macros_spec.md`; this
+subsection covers the firmware structure only.
+
+**Target groups.** Eight device-global named channel sets, each a
+`{target_kind, member_mask, name}` record in `CsGroup` (40 B) held in the live
+`CsGroupConfig` (324 B). `target_kind` reuses the existing `CS_TARGET_*`
+channel spaces, and bit N of `member_mask` is channel N of that space. A
+binding (or macro step) references one by setting `CS_FLAG_GROUP` (0x20) in
+`flags`, which makes the engine re-read `target` as a group index instead of a
+channel index; the noun's `target_kind` must be compatible with the group's
+(`DSP_BAND` nouns take a `DSP_CH` group and validate `index` per member).
+Groups are pure configuration: created and edited by the host, persisted with
+the rest of the CS config, and referenced by index. IR commands do not carry
+the flag; a remote button reaches a group by firing a macro.
+
+**Link laws.** Continuous nouns default to offset-preserving: relative ops
+(`STEP`, `INC`/`DEC`) step every member from its own value so a trim between
+members survives, and absolute `ADJUST` from a pot moves the group *mean* to
+the pot position while each member keeps its offset from the mean captured at
+the start of the gesture. `CS_FLAG_LINK_ABS` (0x40) selects
+absolute-identical instead, driving every member to the same value; it is
+valid only on `ADJUST`, the one action where the two laws differ. Clamping is
+per member, so winding into a rail compresses the spread exactly like ganged
+faders. Bool and enum nouns use the **anchor rule**: the lowest-numbered
+member is read as the anchor, the action is computed against it, and every
+member is driven to the anchor's new value, so a half-muted group becomes
+coherent on the first press.
+
+**Grouped indicators.** `IND_EQUALS` / `IND_ABOVE` evaluate per member and
+combine with OR (lit when any member matches); `CS_FLAG_GROUP_ALL` (0x80)
+selects AND. The caps v8 TON/TOF `on_delay`/`off_delay` filter applies to the
+combined condition. `IND_LEVEL` follows the maximum member value and rejects
+`GROUP_ALL`.
+
+**Fan-out engine.** A grouped op computes every member's absolute target up
+front (`CsGroupOp`, one per binding slot plus one for the macro sequencer),
+then dispatches member-by-member in the same tick through the usual
+`cs_noun_dispatch`. Members whose dispatch returns BUSY stay in a per-slot
+`pend_mask` and retry on later ticks; new detents arriving while members are
+pending fold into the same op, so no input is lost and no member
+double-steps. Relative ops and offset-preserving `ADJUST` run as a *gesture
+session*: at the first event after idle (or after `CS_GROUP_SESSION_TICKS` =
+500 ms of quiet) the engine captures each member's live value as its base and
+thereafter accumulates one delta for the whole session, so targets are always
+`clamp(base_m + delta)`. That replaces the single-target per-op float shadow
+for grouped nouns without needing per-member shadow state. `MOMENTARY`
+captures every member at the press and restores each on release, including
+when the binding is torn down mid-hold. Applying a group SET re-validates
+every binding that references a group; one that no longer validates is
+deactivated with its failure in `slot_status[]` and reactivates when a later
+edit makes it valid again, so there is no in-use refusal.
+
+**Macros.** Eight device-global `{name, step_count, steps[8]}` records
+(`CsMacro` 132 B, `CsMacroConfig` 1060 B). A step is a stripped binding
+(`CsMacroStep`, 12 B) restricted to the `SET` / `TOGGLE` / `INC` / `DEC` /
+`TRIGGER` actions, optionally grouped, with a `pre_delay` in 10 ms units that
+elapses before the step runs. Macros are fired through the appended noun
+`CS_NOUN_MACRO` (52), an enum of `max_macros` positions that accepts `SET`
+(fire macro `value`) and `IND_EQUALS` (lit while that macro runs), so any
+button gesture or IR command fires one with no change to `CsBinding` or
+`IrCommand`; `REQ_CS_MACRO_FIRE` gives hosts and external MCUs the same
+trigger. There is a single sequencer, so one macro runs at a time: a new fire
+cancels the running one at its current step boundary (remaining steps
+dropped, the in-flight step not rolled back) and starts the new one. Steps
+are re-validated at fire time and a step that no longer validates (its group
+emptied or re-kinded) is skipped rather than fatal, which makes a torn host
+edit skip-safe. Steps may not fire macros, so there is no nesting.
+
+Every step dispatches through the same `vendor_dispatch_set` / `_get` surface
+with `CTRL_SOURCE_GPIO` that a single-target binding uses, honouring the same
+BUSY back-pressure, so a macro that loads a preset or switches input inherits
+the existing deferred, pipeline-safe apply machinery; nothing here adds a path
+to the audio pipeline and output slot alignment is untouched by construction.
+The sequencer waits for a step's dispatches to leave the BUSY-pending state
+before starting the next step's delay.
+
+**Control plumbing.** `REQ_SET_CS_GROUP`, `REQ_SET_CS_MACRO` and
+`REQ_SET_CS_MACRO_STEP` are single-deep deferred SETs in the established shape
+(`cs_set_group_pending` / `cs_set_macro_hdr_pending` / `cs_set_macro_step_pending`
+consumed by the main loop into `control_surfaces_apply_group` /
+`_apply_macro_header` / `_apply_macro_step`), reported through the shared
+`cs_last_status` / `cs_last_slot` channel with tags `0x40 | group` and
+`0x60 | macro`. They are apply-live-only previews like every other CS SET:
+`REQ_CS_SAVE` persists groups and macros alongside the bindings, names and IR
+table in the one directory write, and `REQ_CS_REVERT` (or a reboot) restores
+the stored set. `REQ_GET_CS_EXT_STATUS` returns the 24-byte
+`CsExtStatusPacket` (limits, running macro and step, per-group and per-macro
+validity). New status codes are `CS_STATUS_INVALID_GROUP` (0x1F),
+`CS_STATUS_INVALID_MACRO` (0x20) and `CS_STATUS_INVALID_STEP` (0x21). At boot
+groups and macros load before bindings, since bindings validate against
+groups.
+
 ### Persistence and platform placement
 
 The binding table is device-global in the preset directory (388-byte
@@ -2654,8 +2785,9 @@ The binding table is device-global in the preset directory (388-byte
 `dac_hw_mute` and the control-interface config; it survives preset changes and
 factory reset and is not part of `WireBulkParams`. The per-slot names live
 next to it (V10, `cs_names[16][32]`) and the IR command table follows (V11,
-132-byte `CsIrConfig`: version + 8x 16-byte `IrCommand`), all with the same
-lifetime. On RP2040
+132-byte `CsIrConfig`: version + 8x 16-byte `IrCommand`), with the group table
+(V18, 324-byte `CsGroupConfig`) and macro table (V18, 1060-byte
+`CsMacroConfig`) appended last, all with the same lifetime. On RP2040
 `control_surfaces.c.o`, `control_surfaces_nouns.c.o`, and the decode side of
 `control_surfaces_ir.c.o` execute from flash XIP
 (see Memory Layout); only the IR edge ISR is RAM-pinned
@@ -2666,12 +2798,15 @@ nouns (35-40) are RP2350-only (empty
 action mask on RP2040), and the `OUTPUT_DELAY` range follows the platform's
 delay ring (21 ms RP2040 / 42 ms RP2350 at 48 kHz). New BSS for the IR feature is roughly 0.9 KB on both
 platforms (capture ring 256 B, frame buffer 224 B, command table plus per-command
-op state ~400 B).
+op state ~400 B). Groups and macros add roughly 4.3 KB on RP2350 and 3.6 KB on
+RP2040: the 1,384-byte live tables, the same again in the `dir_cache` mirror,
+and 17 `CsGroupOp` contexts (16 binding slots plus the macro sequencer) whose
+`base[NUM_CHANNELS]` array makes each ~92 B on RP2350 and ~52 B on RP2040.
 
 ---
 
 ## Vendor Command Reference
-*Last updated: 2026-07-18 (stereo upmixer commands 0x4A-0x4E added, RP2350 only)*
+*Last updated: 2026-08-09 (Control Surfaces target-group and macro commands 0x20-0x26 added)*
 
 **Band-index map (PEQ and crossover share one address space):**
 
@@ -2687,6 +2822,13 @@ op state ~400 B).
 
 | Command | Code | Direction | Description |
 |---------|------|-----------|-------------|
+| REQ_SET_CS_GROUP | 0x20 | OUT | Set a Control Surfaces target group (wValue=group 0-7, payload=40-byte CsGroup; all-zero clears); apply-live-only preview, deferred, poll 0x87 (last_slot = 0x40\|group) |
+| REQ_GET_CS_GROUP | 0x21 | IN | Get the live 40-byte CsGroup (wValue=group 0-7) |
+| REQ_SET_CS_MACRO | 0x22 | OUT | Set a macro's name and step count (wValue=macro 0-7, payload=36-byte CsMacroHeaderWire); apply-live-only, deferred, poll 0x87 (last_slot = 0x60\|macro) |
+| REQ_GET_CS_MACRO | 0x23 | IN | Get the live 132-byte CsMacro (wValue=macro 0-7) |
+| REQ_SET_CS_MACRO_STEP | 0x24 | OUT | Set one macro step (wValue=(step << 8)\|macro, payload=12-byte CsMacroStep; all-zero clears); apply-live-only, deferred, poll 0x87 |
+| REQ_CS_MACRO_FIRE | 0x25 | IN | Fire a macro (wValue=macro 0-7; 0xFFFF cancels the running one); returns 1 status byte |
+| REQ_GET_CS_EXT_STATUS | 0x26 | IN | Get the 24-byte CsExtStatusPacket (group/macro limits, running macro and step, per-group and per-macro validity) |
 | REQ_SET_PSYBASS | 0x30 | OUT | Enable/disable psychoacoustic bass (1 byte, 0/1) |
 | REQ_GET_PSYBASS | 0x31 | IN | Get psybass enabled state (1 byte) |
 | REQ_SET_PSYBASS_CUTOFF | 0x32 | OUT | Set cutoff (4-byte LE IEEE754 float, 30-300 Hz, clamped) |
@@ -2764,7 +2906,7 @@ op state ~400 B).
 | REQ_CLEAR_CLIPS | 0x83 | IN | Read-then-clear clip flags (see Clip Detection) |
 | REQ_SET_CS_BINDING | 0x84 | OUT | Set a Control Surfaces binding (wValue=slot 0-15, payload=24-byte CsBinding, required; short payload = INVALID_VALUE); apply-live-only preview, deferred, poll 0x87; persist via REQ_CS_SAVE (see Control Surfaces) |
 | REQ_GET_CS_BINDING | 0x85 | IN | Get the live 24-byte CsBinding for a slot (wValue=slot) |
-| REQ_GET_CS_CAPS | 0x86 | IN | Get capability tables (wValue=0xFFFF: 40-byte header+type table+max_ir_commands, caps v8; wValue=noun: 12-byte CsNounDesc) |
+| REQ_GET_CS_CAPS | 0x86 | IN | Get capability tables (wValue=0xFFFF: 40-byte header+type table+max_ir_commands+max_groups/max_macros/max_macro_steps, caps v9; wValue=noun: 12-byte CsNounDesc) |
 | REQ_GET_CS_STATUS | 0x87 | IN | Get 41-byte CsStatusPacket (last SET result, dirty flag, active_mask, per-slot status, ir_active_mask, learn state, per-sub-slot IR status) |
 | REQ_SET_CS_NAME | 0x8B | OUT | Set a Control Surfaces slot name (wValue=slot 0-15, payload=1-32 bytes; one NUL byte clears); apply-live-only preview (persist via 0x9D), poll 0x87 for result |
 | REQ_GET_CS_NAME | 0x8C | IN | Get a Control Surfaces slot name (wValue=slot, returns 32 bytes NUL-terminated, live) |
@@ -2784,7 +2926,7 @@ op state ~400 B).
 | REQ_PRESET_GET_ACTIVE | 0x9A | IN | Get active preset slot (1 byte, always 0-9) |
 | REQ_SET_CHANNEL_NAME | 0x9B | OUT | Set channel name (wValue=channel, payload=1-32 bytes) |
 | REQ_GET_CHANNEL_NAME | 0x9C | IN | Get channel name (wValue=channel, returns 32 bytes) |
-| REQ_CS_SAVE | 0x9D | IN | Persist the whole live Control Surfaces config (bindings + IR commands) in one directory write; deferred, poll 0x87 (last_slot=0xFF); clears the dirty flag |
+| REQ_CS_SAVE | 0x9D | IN | Persist the whole live Control Surfaces config (bindings + names + IR commands + groups + macros) in one directory write; deferred, poll 0x87 (last_slot=0xFF); clears the dirty flag |
 | REQ_CS_REVERT | 0x9E | IN | Discard the live Control Surfaces preview and re-apply the stored config; deferred, poll 0x87 (last_slot=0xFF); no flash write |
 | REQ_GET_ALL_PARAMS | 0xA0 | IN | Get complete DSP state (3664 bytes at V11, multi-packet control transfer) |
 | REQ_SET_ALL_PARAMS | 0xA1 | OUT | Set complete DSP state (3664 bytes at V11, multi-packet control transfer) |
