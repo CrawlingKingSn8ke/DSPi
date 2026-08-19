@@ -1814,9 +1814,11 @@ void core0_init() {
 
     // Initial loudness table computation (uses loaded or default params)
     loudness_recompute_table(loudness_ref_spl, loudness_intensity_pct, 48000.0f);
-    if (loudness_enabled && loudness_active_table) {
-        audio_set_volume(audio_state.volume);  // Re-select loudness coefficients
-    }
+
+    // Boot safety: preset restore may have loaded a louder saved user volume.
+    // Force the listening volume back to -20 dB after all persisted settings
+    // have been applied.  update_user_volume() also re-keys loudness.
+    update_user_volume(-20.0f);
 
     // Initial volume leveller setup (uses loaded or default params)
     leveller_compute_coefficients(&leveller_coeffs, (const LevellerConfig *)&leveller_config, 48000.0f);

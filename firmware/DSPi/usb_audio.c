@@ -494,9 +494,16 @@ static uint16_t db_to_vol[CENTER_VOLUME_INDEX + 1] = {
 
 #define ENCODE_DB(x) ((int16_t)((x)*256))
 #define MIN_VOLUME           ENCODE_DB(-CENTER_VOLUME_INDEX)
-#define DEFAULT_VOLUME       ENCODE_DB(0)
+#define DEFAULT_VOLUME       ENCODE_DB(-20)
 #define MAX_VOLUME           ENCODE_DB(0)
 #define VOLUME_RESOLUTION    ENCODE_DB(1)
+
+// Boot-only USB volume safety.  For the first three seconds after USB
+// initialization, reject host requests that would raise the user/listening
+// volume.  Lower-volume requests remain valid, and device-side controls using
+// update_user_volume() are intentionally unaffected.
+#define BOOT_VOLUME_GUARD_US 3000000ULL
+static uint64_t boot_volume_guard_until_us = 0;
 
 // Apply a vol_index to the live audio path (vol_mul + loudness coeffs).
 // See usb_audio.h for the contract.  Extracted from audio_set_volume() so
@@ -532,6 +539,21 @@ void apply_vol_index_to_audio(uint8_t vol_index) {
 }
 
 void audio_set_volume(int16_t volume) {
+    // Windows commonly restores its remembered USB volume during enumeration.
+    // Keep the safe boot value during the startup window, while still allowing
+    // the host to make the device quieter.  This deadline is armed only by
+    // usb_sound_card_init(), never by stream restarts or input-source changes.
+    if (boot_volume_guard_until_us != 0) {
+        uint64_t now = time_us_64();
+        if (now < boot_volume_guard_until_us) {
+            if (volume > audio_state.volume) {
+                return;
+            }
+        } else {
+            boot_volume_guard_until_us = 0;
+        }
+    }
+
     // Always record the host's last-set value so GET_CUR round-trips correctly
     // — Windows compares what it read back against what it last wrote.
     audio_state.volume = volume;
@@ -1418,7 +1440,9 @@ static bool uac1_driver_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_cont
                 // they listen to for vendor-channel writes.  Clamp to the
                 // documented apply range; the dB the listener actually
                 // hears is what the device should report.
-                float notify_db = (float)v / 256.0f;
+                // Report the value actually accepted.  During the boot guard,
+                // an unsafe upward request is rejected by audio_set_volume().
+                float notify_db = (float)audio_state.volume / 256.0f;
                 if (notify_db < -(float)CENTER_VOLUME_INDEX) notify_db = -(float)CENTER_VOLUME_INDEX;
                 if (notify_db > 0.0f) notify_db = 0.0f;
                 notify_param_write(offsetof(WireBulkParams, user_volume.user_volume_db),
@@ -1802,6 +1826,7 @@ void usb_sound_card_init(void) {
     dsp_init_default_filters();
     dsp_recalculate_all_filters(48000.0f);
     audio_set_volume(DEFAULT_VOLUME);
+    boot_volume_guard_until_us = time_us_64() + BOOT_VOLUME_GUARD_US;
     rate_change_pending = true;
     pending_rate = audio_state.freq;
 
