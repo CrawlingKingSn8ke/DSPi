@@ -225,6 +225,7 @@ volatile bool notify_master_vol_host_initiated = false;
 
 // Defined in the UAC1 CLASS DRIVER section below.
 static void usb_notify_drain(uint8_t rhport);
+static void usb_volume_status_drain(uint8_t rhport);
 
 // Per-channel gain and mute (legacy 3-channel interface for flash compatibility)
 volatile float channel_gain_db[3] = {0.0f, 0.0f, 0.0f};
@@ -435,6 +436,7 @@ void update_user_volume(float db) {
 // fired yet) since xfer_cb only re-arms after a completion.
 void usb_notify_tick(void) {
     usb_notify_drain(0);
+    usb_volume_status_drain(0);
 }
 
 // Sync State
@@ -498,12 +500,52 @@ static uint16_t db_to_vol[CENTER_VOLUME_INDEX + 1] = {
 #define MAX_VOLUME           ENCODE_DB(0)
 #define VOLUME_RESOLUTION    ENCODE_DB(1)
 
-// Boot-only USB volume safety.  For the first three seconds after USB
-// initialization, reject host requests that would raise the user/listening
-// volume.  Lower-volume requests remain valid, and device-side controls using
-// update_user_volume() are intentionally unaffected.
-#define BOOT_VOLUME_GUARD_US 3000000ULL
-static uint64_t boot_volume_guard_until_us = 0;
+typedef enum {
+    USB_VOL_SYNC_ARMED = 0,
+    USB_VOL_SYNC_WAIT_READBACK,
+    USB_VOL_SYNC_NORMAL,
+} UsbVolumeSyncState;
+
+// Event-driven USB Feature Unit volume safety.  A re-arm forces -20 dB and
+// stays protected until a safe host value is accepted or a louder restore is
+// blocked and the subsequent UAC1 status/readback handshake completes.
+static volatile UsbVolumeSyncState usb_volume_sync_state = USB_VOL_SYNC_NORMAL;
+static volatile bool usb_volume_status_pending = false;
+static volatile bool usb_volume_status_in_flight = false;
+static volatile bool usb_volume_status_delivered = false;
+
+static bool usb_volume_host_set_allowed(int16_t volume) {
+    if (usb_volume_sync_state == USB_VOL_SYNC_NORMAL) return true;
+
+    if (volume <= DEFAULT_VOLUME) {
+        usb_volume_sync_state = USB_VOL_SYNC_NORMAL;
+        usb_volume_status_pending = false;
+        usb_volume_status_delivered = false;
+        return true;
+    }
+
+    // Leave audio_state.volume at the real -20 dB value and request a
+    // standards-based host resynchronization through the AC status endpoint.
+    usb_volume_sync_state = USB_VOL_SYNC_WAIT_READBACK;
+    usb_volume_status_pending = true;
+    usb_volume_status_delivered = false;
+    return false;
+}
+
+void usb_volume_safety_rearm(void) {
+    update_user_volume(-20.0f);
+
+    usb_volume_status_delivered = false;
+    if (tud_mounted()) {
+        usb_volume_sync_state = USB_VOL_SYNC_WAIT_READBACK;
+        usb_volume_status_pending = true;
+    } else {
+        usb_volume_sync_state = USB_VOL_SYNC_ARMED;
+        usb_volume_status_pending = false;
+    }
+}
+
+
 
 // Apply a vol_index to the live audio path (vol_mul + loudness coeffs).
 // See usb_audio.h for the contract.  Extracted from audio_set_volume() so
@@ -539,23 +581,8 @@ void apply_vol_index_to_audio(uint8_t vol_index) {
 }
 
 void audio_set_volume(int16_t volume) {
-    // Windows commonly restores its remembered USB volume during enumeration.
-    // Keep the safe boot value during the startup window, while still allowing
-    // the host to make the device quieter.  This deadline is armed only by
-    // usb_sound_card_init(), never by stream restarts or input-source changes.
-    if (boot_volume_guard_until_us != 0) {
-        uint64_t now = time_us_64();
-        if (now < boot_volume_guard_until_us) {
-            if (volume > audio_state.volume) {
-                return;
-            }
-        } else {
-            boot_volume_guard_until_us = 0;
-        }
-    }
-
     // Always record the host's last-set value so GET_CUR round-trips correctly
-    // — Windows compares what it read back against what it last wrote.
+    // — hosts may compare what they read back against what they last wrote.
     audio_state.volume = volume;
 
     // Host volume control is inert when USB isn't the DSP input source.  The
@@ -826,6 +853,7 @@ static struct {
     uint8_t cur_alt;         // Current AS alt setting (0, 1, or 2)
     bool    ep_data_open;
     bool    ep_fb_open;
+    bool    ac_status_ep_open;
     bool    notify_ep_open;  // Interrupt IN EP 0x83 on the vendor interface
     // Deferred SET_CUR context (captured at SETUP, applied at DATA)
     uint8_t pending_cs;
@@ -836,6 +864,9 @@ static struct {
 // Stable TX buffer for the notification EP — DCD may DMA from it until
 // xfer_cb fires. Placed in RAM for flash-operation safety.
 static uint8_t __attribute__((aligned(4))) __not_in_flash("notify_buf") notify_buf[NOTIFY_EP_MAX_PKT];
+
+// Stable UAC1 AudioControl status word: bStatusType, bOriginator.
+static uint8_t __attribute__((aligned(4))) ac_status_buf[AUDIO_STATUS_EP_MAX_PKT];
 
 // usb_notify_drain is forward-declared near the other notification state at
 // the top of this file so update_master_volume() can reach it.
@@ -899,7 +930,12 @@ static void uac1_driver_reset(uint8_t rhport) {
     (void)rhport;
     uac1.ep_data_open = false;
     uac1.ep_fb_open = false;
+    uac1.ac_status_ep_open = false;
     uac1.notify_ep_open = false;
+    usb_volume_status_in_flight = false;
+    usb_volume_status_delivered = false;
+    if (usb_volume_sync_state == USB_VOL_SYNC_WAIT_READBACK)
+        usb_volume_status_pending = true;
     uac1.cur_alt = 0;
     uac1.vendor_itf = 0xFF;
     usb_audio_alt_set = 0;
@@ -958,6 +994,19 @@ static uint16_t uac1_driver_open(uint8_t rhport, tusb_desc_interface_t const *it
     while (p_desc < p_end && tu_desc_type(p_desc) == TUSB_DESC_CS_INTERFACE) {
         drv_len += tu_desc_len(p_desc);
         p_desc += tu_desc_len(p_desc);
+    }
+
+    // Open the optional UAC1 AudioControl status endpoint that follows the
+    // class-specific AC descriptors.
+    if (p_desc < p_end && tu_desc_type(p_desc) == TUSB_DESC_ENDPOINT) {
+        tusb_desc_endpoint_t const *ep = (tusb_desc_endpoint_t const *)p_desc;
+        if (ep->bEndpointAddress == AUDIO_STATUS_ENDPOINT &&
+            ep->bmAttributes.xfer == TUSB_XFER_INTERRUPT) {
+            TU_ASSERT(usbd_edpt_open(rhport, ep));
+            uac1.ac_status_ep_open = true;
+            drv_len += tu_desc_len(p_desc);
+            p_desc += tu_desc_len(p_desc);
+        }
     }
 
     // Walk all AS alt settings (0, 1, 2) and their endpoints.
@@ -1024,6 +1073,27 @@ static inline void uac1_arm_feedback(uint8_t rhport) {
     ep_fb_buf[2] = (uint8_t)((fb >> 16) & 0xFF);
     ep_fb_buf[3] = 0;
     usbd_edpt_xfer(rhport, AUDIO_IN_ENDPOINT, ep_fb_buf, 3);
+}
+
+static void usb_volume_status_drain(uint8_t rhport) {
+    if (!uac1.ac_status_ep_open || !usb_volume_status_pending ||
+        usb_volume_status_in_flight) return;
+
+    if (!usbd_edpt_claim(rhport, AUDIO_STATUS_ENDPOINT)) return;
+
+    // UAC1 status word: interrupt pending, AudioControl-interface originator,
+    // Feature Unit ID 2.
+    ac_status_buf[0] = 0x80u;
+    ac_status_buf[1] = UAC1_FEATURE_UNIT_ID;
+
+    if (!usbd_edpt_xfer(rhport, AUDIO_STATUS_ENDPOINT, ac_status_buf,
+                        sizeof(ac_status_buf))) {
+        usbd_edpt_release(rhport, AUDIO_STATUS_ENDPOINT);
+        return;
+    }
+
+    usb_volume_status_pending = false;
+    usb_volume_status_in_flight = true;
 }
 
 // Open isochronous endpoints for the specified alt (1..5 on RP2350, 1..2 else).
@@ -1282,6 +1352,10 @@ static bool uac1_apply_alt(uint8_t rhport, uint8_t alt) {
 static bool uac1_handle_fu_get(uint8_t rhport, tusb_control_request_t const *req) {
     uint8_t cs = TU_U16_HIGH(req->wValue);
     switch (req->bRequest) {
+        case 0xFF: { // UAC1 GET_STAT
+            static uint8_t status_dummy;
+            return tud_control_xfer(rhport, req, &status_dummy, 0);
+        }
         case UAC1_REQ_GET_CUR:
             if (cs == UAC1_FU_CTRL_MUTE) {
                 static uint8_t m;
@@ -1291,6 +1365,11 @@ static bool uac1_handle_fu_get(uint8_t rhport, tusb_control_request_t const *req
             if (cs == UAC1_FU_CTRL_VOLUME) {
                 static int16_t v;
                 v = audio_state.volume;
+                if (usb_volume_sync_state == USB_VOL_SYNC_WAIT_READBACK &&
+                    usb_volume_status_delivered) {
+                    usb_volume_sync_state = USB_VOL_SYNC_NORMAL;
+                    usb_volume_status_delivered = false;
+                }
                 return tud_control_xfer(rhport, req, &v, 2);
             }
             break;
@@ -1434,7 +1513,8 @@ static bool uac1_driver_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_cont
                 // same shared field — hosts that watch user_volume.user_volume_db
                 // can attribute the change correctly.
                 notify_set_source(PARAM_SRC_UAC1);
-                audio_set_volume(v);
+                bool accepted = usb_volume_host_set_allowed(v);
+                if (accepted) audio_set_volume(v);
                 // Mirror update_user_volume()'s emit so v2 hosts see the
                 // OS volume slider move on the same WireBulkParams field
                 // they listen to for vendor-channel writes.  Clamp to the
@@ -1524,6 +1604,17 @@ static bool __not_in_flash_func(uac1_driver_xfer_cb)(uint8_t rhport, uint8_t ep_
     if (ep_addr == AUDIO_IN_ENDPOINT) {
         // Feedback packet transmitted; publish the current value and re-arm.
         if (uac1.ep_fb_open) uac1_arm_feedback(rhport);
+        return true;
+    }
+
+    if (ep_addr == AUDIO_STATUS_ENDPOINT) {
+        usb_volume_status_in_flight = false;
+        if (result == XFER_RESULT_SUCCESS &&
+            xferred_bytes == AUDIO_STATUS_EP_MAX_PKT) {
+            usb_volume_status_delivered = true;
+        } else {
+            usb_volume_status_pending = true;
+        }
         return true;
     }
 
@@ -1826,7 +1917,6 @@ void usb_sound_card_init(void) {
     dsp_init_default_filters();
     dsp_recalculate_all_filters(48000.0f);
     audio_set_volume(DEFAULT_VOLUME);
-    boot_volume_guard_until_us = time_us_64() + BOOT_VOLUME_GUARD_US;
     rate_change_pending = true;
     pending_rate = audio_state.freq;
 

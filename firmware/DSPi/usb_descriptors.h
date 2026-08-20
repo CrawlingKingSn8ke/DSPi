@@ -34,7 +34,8 @@
 // terminal/feature unit + larger iso OUT max-packet.
 // 0x0202 → 0x0203 for the 4ch/6ch input alts + the unified channel model
 // (per-input EQ/metering, wire V16 / slot V21).
-#define USB_BCD_DEVICE  0x0203
+// 0x0203 -> 0x0204 for UAC1 AudioControl status notification support.
+#define USB_BCD_DEVICE  0x0204
 
 // ----------------------------------------------------------------------------
 // ENDPOINT ADDRESSES
@@ -42,6 +43,9 @@
 
 #define AUDIO_OUT_ENDPOINT  0x01U
 #define AUDIO_IN_ENDPOINT   0x82U
+#define AUDIO_STATUS_ENDPOINT         0x84U
+#define AUDIO_STATUS_EP_MAX_PKT       2U
+#define AUDIO_STATUS_EP_INTERVAL_MS   4U
 #if PICO_RP2350
 // RP2350 also serves an 8-channel/48 kHz/16-bit alt (3): 48 frames × 8 ch ×
 // 2 B = 768 B, + 1 jitter frame (16 B) = 784, rounded up to a 4-byte-aligned

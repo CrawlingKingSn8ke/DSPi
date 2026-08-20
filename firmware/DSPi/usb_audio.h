@@ -229,6 +229,11 @@ void update_master_volume(float db);
 // (e.g. "Console only writes during non-USB input") are not enforced here.
 void update_user_volume(float db);
 
+// Force the listening volume to the safe USB-entry value and arm the
+// event-driven UAC1 host synchronization handshake.  Main-loop only; no
+// elapsed-time startup window is used.
+void usb_volume_safety_rearm(void);
+
 // Apply a vol_index in [0..CENTER_VOLUME_INDEX] to the live audio path.
 // Updates audio_state.vol_mul (consumed click-free by the audio pipeline's
 // per-packet ramp) and refreshes current_loudness_coeffs when loudness is

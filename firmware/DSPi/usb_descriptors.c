@@ -152,7 +152,7 @@ static const tusb_desc_device_t device_descriptor = {
 //   + output(9) + AS alt0(9) + 2×stereo-alt + N×multichannel-alt + vendor(9)
 //   + notify(7).
 #define CONFIG_BASE_LEN  (9 + 8 + 9 + 9 + 12 + UAC1_FU_LEN + 9 \
-                          + 9 \
+                          + 7 + 9 \
                           + 2 * AS_STEREO_ALT_LEN \
                           + NUM_MULTICH_ALTS * AS_MULTICH_ALT_LEN \
                           + 9 + 7)
@@ -171,7 +171,7 @@ static const tusb_desc_device_t device_descriptor = {
 // Per-alt EP descriptor offsets, computed so they self-adjust to UAC1_FU_LEN
 // and the optional alt3 block.  The _Static_assert on the array byte count
 // (below) catches any arithmetic slip at compile time.
-#define OFFSET_AS_ALT1      (9 + 8 + 9 + 9 + 12 + UAC1_FU_LEN + 9 + 9)  // after AS alt0
+#define OFFSET_AS_ALT1      (9 + 8 + 9 + 9 + 12 + UAC1_FU_LEN + 9 + 7 + 9)  // after AC status + AS alt0
 #define OFFSET_ALT1_DATA_EP (OFFSET_AS_ALT1 + 9 + 7 + 17)
 #define OFFSET_ALT1_FB_EP   (OFFSET_ALT1_DATA_EP + 9 + 7)
 #define OFFSET_AS_ALT2      (OFFSET_AS_ALT1 + AS_STEREO_ALT_LEN)
@@ -237,7 +237,7 @@ const uint8_t usb_config_descriptor[] = {
     TUSB_DESC_INTERFACE,                // bDescriptorType
     ITF_NUM_AUDIO_CONTROL,              // bInterfaceNumber
     0x00,                               // bAlternateSetting
-    0x00,                               // bNumEndpoints
+    0x01,                               // bNumEndpoints (UAC1 status interrupt IN)
     TUSB_CLASS_AUDIO,                   // bInterfaceClass
     AUDIO_SUBCLASS_CONTROL,             // bInterfaceSubClass
     0x00,                               // bInterfaceProtocol (UAC1 = 0x00)
@@ -289,6 +289,15 @@ const uint8_t usb_config_descriptor[] = {
     0x00,                               // bAssocTerminal
     UAC1_FEATURE_UNIT_ID,               // bSourceID
     0x00,                               // iTerminal
+
+    // --- AC status interrupt endpoint ------------------------------------
+    // UAC1 status word: bStatusType + bOriginator.  The endpoint is armed
+    // only when device-side Feature Unit state needs host resynchronization.
+    7, TUSB_DESC_ENDPOINT,
+    AUDIO_STATUS_ENDPOINT,
+    TUSB_XFER_INTERRUPT,
+    U16_TO_U8S_LE(AUDIO_STATUS_EP_MAX_PKT),
+    AUDIO_STATUS_EP_INTERVAL_MS,
 
     // --- 66: AS std interface alt 0 (zero-bw) ----------------------------
     9,                                  // bLength

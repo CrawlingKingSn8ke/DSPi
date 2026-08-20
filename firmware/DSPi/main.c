@@ -1815,10 +1815,11 @@ void core0_init() {
     // Initial loudness table computation (uses loaded or default params)
     loudness_recompute_table(loudness_ref_spl, loudness_intensity_pct, 48000.0f);
 
-    // Boot safety: preset restore may have loaded a louder saved user volume.
-    // Force the listening volume back to -20 dB after all persisted settings
-    // have been applied.  update_user_volume() also re-keys loudness.
-    update_user_volume(-20.0f);
+    // USB boot safety: only the USB source is forced to -20 dB here.
+    // Non-USB sources keep their loaded level and arm on their next USB entry.
+    if (active_input_source == INPUT_SOURCE_USB) {
+        usb_volume_safety_rearm();
+    }
 
     // Initial volume leveller setup (uses loaded or default params)
     leveller_compute_coefficients(&leveller_coeffs, (const LevellerConfig *)&leveller_config, 48000.0f);
@@ -3701,17 +3702,11 @@ int main(void) {
                 }
 #endif
                 else {
-                    // Switching to USB: flush stale ring data, complete reset
+                    // Switching to USB: force the safe listening level and
+                    // synchronize the host through the UAC1 status endpoint.
                     usb_audio_flush_ring();
+                    usb_volume_safety_rearm();
                     complete_pipeline_reset();
-
-                    // Thaw the cached host volume.  audio_set_volume() bails
-                    // when source != USB, so any host SET_CUR Volume requests
-                    // received during SPDIF mode were recorded into
-                    // audio_state.volume but never applied to vol_mul or the
-                    // loudness coefficient pointer.  Re-applying here brings
-                    // the live gain path in line with what Windows last sent.
-                    audio_set_volume(audio_state.volume);
 
                     // Close the switch-window race: a host SET_CUR that
                     // landed after the old-source branch read the retained
