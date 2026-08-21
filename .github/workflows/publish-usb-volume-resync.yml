@@ -1,4 +1,4 @@
-name: Publish USB host volume resync test build
+name: Update USB host volume resync release notes
 
 on:
   pull_request:
@@ -8,69 +8,32 @@ permissions:
   contents: write
 
 jobs:
-  publish:
+  update-release-notes:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout release source
-        uses: actions/checkout@v4
-        with:
-          ref: c805bc5364e0191238ffddbf00609a8a6787a8b3
-          fetch-depth: 0
-          submodules: false
-
-      - name: Checkout required SDK components
-        shell: bash
-        run: |
-          set -euo pipefail
-          git submodule update --init firmware/pico-sdk
-          git -C firmware/pico-sdk submodule update --init lib/tinyusb
-
-      - name: Install ARM toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
-
-      - name: Build Pico 2 RP2350
-        shell: bash
-        run: |
-          set -euo pipefail
-          cmake -S firmware -B build-rp2350 -DPICO_BOARD=pico2 -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-rp2350 --parallel 2
-          test -f build-rp2350/DSPi/DSPi.uf2
-          python3 scripts/check_ram_placement.py build-rp2350/DSPi/DSPi.elf > /tmp/ram.txt 2>&1 || true
-          grep -q "A summary: 0 FAIL" /tmp/ram.txt
-          grep -q "B summary: 0 FAIL" /tmp/ram.txt
-          grep -q "B2 summary: .*0 FAIL" /tmp/ram.txt
-
-      - name: Package test build
-        shell: bash
-        run: |
-          set -euo pipefail
-          cp build-rp2350/DSPi/DSPi.uf2 DSPi-Pico2-USB-host-volume-resync.uf2
-          sha256sum DSPi-Pico2-USB-host-volume-resync.uf2 > DSPi-Pico2-USB-host-volume-resync.uf2.sha256
-
-      - name: Update tag and release
+      - name: Update release notes
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: v1.1.6-beta1-usb-safe-20db
-          TARGET: c805bc5364e0191238ffddbf00609a8a6787a8b3
         shell: bash
         run: |
           set -euo pipefail
-          git tag -f "$TAG" "$TARGET"
-          git push origin "refs/tags/$TAG" --force
+          NOTES=$(cat <<'EOF'
+          Event-driven UAC1 host volume resynchronization.
 
-          NOTES='Event-driven UAC1 host volume resynchronization. USB entry forces User Volume to -20 dB, reports the device-side change through the AudioControl status endpoint, and resumes normal host volume control after readback. The previous timed startup guard has been removed.'
+          Supported firmware targets:
+          - Raspberry Pi Pico 2 — RP2350
+          - Raspberry Pi Pico — RP2040
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --target "$TARGET" --title "DSPi v1.1.6 beta1 USB safe -20 dB" --notes "$NOTES"
-          else
-            gh release create "$TAG" --target "$TARGET" --title "DSPi v1.1.6 beta1 USB safe -20 dB" --notes "$NOTES"
-          fi
+          USB entry forces User Volume to -20 dB, reports the device-side change through the AudioControl status endpoint, and resumes normal host volume control after readback. The previous timed startup guard has been removed.
 
-          gh release upload "$TAG" \
-            DSPi-Pico2-USB-host-volume-resync.uf2 \
-            DSPi-Pico2-USB-host-volume-resync.uf2.sha256 \
-            --clobber
-
-          gh release view "$TAG" --json url,tagName,targetCommitish,assets
+          Release asset note:
+          - DSPi-Pico2-USB-host-volume-resync.uf2 is the RP2350 / Raspberry Pi Pico 2 test build.
+          - RP2040 / Raspberry Pi Pico was also compile- and RAM-placement regression-tested successfully, but an RP2040 UF2 is not attached to this test release.
+          EOF
+          )
+          gh release edit "$TAG" \
+            --repo CrawlingKingSn8ke/DSPi \
+            --title "DSPi v1.1.6 beta1 USB safe -20 dB" \
+            --notes "$NOTES"
+          gh release view "$TAG" --repo CrawlingKingSn8ke/DSPi --json url,tagName,targetCommitish,name,body,assets
