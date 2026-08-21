@@ -1,4 +1,4 @@
-name: Update USB host volume resync release notes
+name: Publish RP2350 and RP2040 USB host volume resync builds
 
 on:
   pull_request:
@@ -8,32 +8,95 @@ permissions:
   contents: write
 
 jobs:
-  update-release-notes:
+  publish:
     runs-on: ubuntu-latest
     steps:
-      - name: Update release notes
+      - name: Checkout verified firmware
+        uses: actions/checkout@v4
+        with:
+          ref: c805bc5364e0191238ffddbf00609a8a6787a8b3
+          fetch-depth: 0
+          submodules: false
+
+      - name: Checkout required SDK components
+        shell: bash
+        run: |
+          set -euo pipefail
+          git submodule update --init firmware/pico-sdk
+          git -C firmware/pico-sdk submodule update --init lib/tinyusb
+
+      - name: Install ARM toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
+
+      - name: Build Pico 2 RP2350
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S firmware -B build-rp2350 -DPICO_BOARD=pico2 -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-rp2350 --parallel 2
+          test -f build-rp2350/DSPi/DSPi.uf2
+          python3 scripts/check_ram_placement.py build-rp2350/DSPi/DSPi.elf > /tmp/rp2350-ram.txt 2>&1 || true
+          grep -q "A summary: 0 FAIL" /tmp/rp2350-ram.txt
+          grep -q "B summary: 0 FAIL" /tmp/rp2350-ram.txt
+          grep -q "B2 summary: .*0 FAIL" /tmp/rp2350-ram.txt
+
+      - name: Build Pico RP2040
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S firmware -B build-rp2040 -DPICO_BOARD=pico -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-rp2040 --parallel 2
+          test -f build-rp2040/DSPi/DSPi.uf2
+          python3 scripts/check_ram_placement.py build-rp2040/DSPi/DSPi.elf > /tmp/rp2040-ram.txt 2>&1 || true
+          grep -q "A summary: 0 FAIL" /tmp/rp2040-ram.txt
+          grep -q "B summary: 0 FAIL" /tmp/rp2040-ram.txt
+          grep -q "B2 summary: .*0 FAIL" /tmp/rp2040-ram.txt
+
+      - name: Package explicit target assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp build-rp2350/DSPi/DSPi.uf2 DSPi-Pico2-RP2350-USB-host-volume-resync.uf2
+          cp build-rp2040/DSPi/DSPi.uf2 DSPi-Pico-RP2040-USB-host-volume-resync.uf2
+          sha256sum DSPi-Pico2-RP2350-USB-host-volume-resync.uf2 > DSPi-Pico2-RP2350-USB-host-volume-resync.uf2.sha256
+          sha256sum DSPi-Pico-RP2040-USB-host-volume-resync.uf2 > DSPi-Pico-RP2040-USB-host-volume-resync.uf2.sha256
+
+      - name: Replace release assets and update notes
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: v1.1.6-beta1-usb-safe-20db
         shell: bash
         run: |
           set -euo pipefail
+
+          gh release delete-asset "$TAG" DSPi-Pico2-USB-host-volume-resync.uf2 --repo CrawlingKingSn8ke/DSPi --yes || true
+          gh release delete-asset "$TAG" DSPi-Pico2-USB-host-volume-resync.uf2.sha256 --repo CrawlingKingSn8ke/DSPi --yes || true
+
+          gh release upload "$TAG" \
+            DSPi-Pico2-RP2350-USB-host-volume-resync.uf2 \
+            DSPi-Pico2-RP2350-USB-host-volume-resync.uf2.sha256 \
+            DSPi-Pico-RP2040-USB-host-volume-resync.uf2 \
+            DSPi-Pico-RP2040-USB-host-volume-resync.uf2.sha256 \
+            --repo CrawlingKingSn8ke/DSPi --clobber
+
           NOTES=$(cat <<'EOF'
           Event-driven UAC1 host volume resynchronization.
 
-          Supported firmware targets:
-          - Raspberry Pi Pico 2 — RP2350
-          - Raspberry Pi Pico — RP2040
+          Supported firmware targets and release assets:
+          - Raspberry Pi Pico 2 / RP2350 — DSPi-Pico2-RP2350-USB-host-volume-resync.uf2
+          - Raspberry Pi Pico / RP2040 — DSPi-Pico-RP2040-USB-host-volume-resync.uf2
 
           USB entry forces User Volume to -20 dB, reports the device-side change through the AudioControl status endpoint, and resumes normal host volume control after readback. The previous timed startup guard has been removed.
 
-          Release asset note:
-          - DSPi-Pico2-USB-host-volume-resync.uf2 is the RP2350 / Raspberry Pi Pico 2 test build.
-          - RP2040 / Raspberry Pi Pico was also compile- and RAM-placement regression-tested successfully, but an RP2040 UF2 is not attached to this test release.
+          Both RP2350 and RP2040 builds are produced from verified firmware commit c805bc5364e0191238ffddbf00609a8a6787a8b3 and pass the repository hot-code/RAM-placement checks.
           EOF
           )
+
           gh release edit "$TAG" \
             --repo CrawlingKingSn8ke/DSPi \
             --title "DSPi v1.1.6 beta1 USB safe -20 dB" \
             --notes "$NOTES"
+
           gh release view "$TAG" --repo CrawlingKingSn8ke/DSPi --json url,tagName,targetCommitish,name,body,assets
