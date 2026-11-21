@@ -29,6 +29,7 @@ try{
  $lines=@(foreach($name in @('Operation','OperationId','SessionId','EndpointGuid','Payload','ExpectedUser','ModuleHash','WorkerHash','SharedHash','ApoHash')){
   '$'+$name+'='+(Quote (Get-Variable -Name $name -ValueOnly))
  })
+ $lines+='$RestoreProtection='+(Quote ([string]$RestoreProtection))
  $lines+='$BootstrapHost='+(Quote $hostExe)
  $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(($lines -join [Environment]::NewLine)+[Environment]::NewLine+[Text.Encoding]::UTF8.GetString($admin).TrimStart([char]0xfeff)))
  $runner=Start-Process -FilePath $hostExe -ArgumentList ('-NoLogo -NoProfile -NonInteractive -EncodedCommand '+$encoded) -WindowStyle Hidden -PassThru

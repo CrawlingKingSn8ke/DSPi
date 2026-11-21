@@ -110,6 +110,10 @@ try{
   while(!(Test-Path -LiteralPath $done) -and [DateTime]::UtcNow -lt $limit){Start-Sleep -Milliseconds 150}
   if(!(Test-Path -LiteralPath $done)){throw 'Windows did not report that setup completed. Use the protected recovery before retrying.'}
   $outcome=Get-Content -Raw -LiteralPath $done | ConvertFrom-Json
+  if($Operation -eq 'Remove' -and $outcome.RolledBack -and $RestoreProtection -ceq '1'){
+   $protectionResult=Complete-DspiAudioProtection
+   if($protectionResult){exit $protectionResult}
+  }
   if($sharedCreated -and !$outcome.Installed -and !$outcome.RecoveryError){
    Unregister-DspiNewComponent -Classes $classes -DllPath $binary
    $sharedCreated=$false

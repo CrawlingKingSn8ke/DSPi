@@ -30,10 +30,10 @@ internal static class Program
                     OutputSetup.OpenConsoleAsync(output).GetAwaiter().GetResult();
                     return 0;
                 }
-                if (args[0] == "--remove")
+                if (args[0] is "--remove" or "--remove-and-restore-audio")
                 {
-                    OutputSetup.RemoveAsync(output).GetAwaiter().GetResult();
-                    return 0;
+                    if (output.Session == null) return 2;
+                    return OutputSetup.RemoveAsync(output, args[0] == "--remove-and-restore-audio").GetAwaiter().GetResult();
                 }
                 return 2;
             }
@@ -127,14 +127,14 @@ internal static class OutputSetup
         await RunAsync(output, "Install", Guid.NewGuid().ToString("N"));
     }
 
-    internal static async Task RemoveAsync(Output output)
+    internal static async Task<int> RemoveAsync(Output output, bool restoreProtection)
     {
         if (!output.Attached || output.Session == null)
             throw new InvalidOperationException("This output has no attachment made by this installer.");
-        await RunAsync(output, "Remove", output.Session);
+        return await RunAsync(output, "Remove", output.Session, restoreProtection);
     }
 
-    private static async Task RunAsync(Output output, string operation, string session)
+    private static async Task<int> RunAsync(Output output, string operation, string session, bool restoreProtection = false)
     {
         if (!File.Exists(Shell) || !File.Exists(Archive))
             throw new InvalidOperationException("Keep DSPi Setup with every file from its setup folder. Windows PowerShell and the bundled runtime are required.");
@@ -149,7 +149,8 @@ internal static class OutputSetup
             byte[] module = Resource("ProtectedStorage.psm1");
             byte[] worker = Resource("Worker.ps1");
             byte[] admin = Resource("Admin.ps1");
-            byte[] shared = Resource("SharedComponent.psm1");
+            byte[] shared = Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(Resource("SharedComponent.psm1")) + "\n" +
+                Encoding.UTF8.GetString(Resource("AudioProtection.psm1")).TrimStart('\uFEFF'));
             byte[] apo = Resource("Payload.Apo.dll");
             File.WriteAllBytes(Path.Combine(path, "ProtectedStorage.psm1"), module);
             File.WriteAllBytes(Path.Combine(path, "Worker.ps1"), worker);
@@ -159,7 +160,7 @@ internal static class OutputSetup
             using var identity = WindowsIdentity.GetCurrent();
             string user = identity.User?.Value ?? throw new InvalidOperationException("The active Windows user could not be identified.");
             string script = $"$Operation={Quote(operation)}\n$OperationId='{operationId}'\n$SessionId={Quote(session)}\n" +
-                $"$EndpointGuid='{output.Id:B}'\n$Payload={Quote(path)}\n$ExpectedUser={Quote(user)}\n" +
+                $"$RestoreProtection='{(restoreProtection ? 1 : 0)}'\n$EndpointGuid='{output.Id:B}'\n$Payload={Quote(path)}\n$ExpectedUser={Quote(user)}\n" +
                 $"$ModuleHash='{Convert.ToHexString(SHA256.HashData(module))}'\n$WorkerHash='{Convert.ToHexString(SHA256.HashData(worker))}'\n" +
                 $"$ArchivePath={Quote(Archive)}\n$AdminHash='{Convert.ToHexString(SHA256.HashData(admin))}'\n" +
                 $"$SharedHash='{Convert.ToHexString(SHA256.HashData(shared))}'\n$ApoHash='{Convert.ToHexString(SHA256.HashData(apo))}'\n" +
@@ -186,6 +187,7 @@ internal static class OutputSetup
                 ?? throw new InvalidOperationException("Windows returned an unreadable setup result.");
             if (report.Endpoint != output.EndpointId || (operation == "Install" ? !report.Installed : !report.RolledBack))
                 throw new InvalidOperationException(string.Join("\n", new[] { report.Error ?? "Setup could not be confirmed.", report.RecoveryError }.OfType<string>()));
+            return process.ExitCode;
         }
         finally
         {
@@ -291,6 +293,15 @@ internal sealed class SetupWindow : Form
     private async Task RunSelected(bool removeAttachment)
     {
         if (busy || outputs.SelectedItem is not Output output) return;
+        bool restoreProtection = false;
+        if (removeAttachment)
+        {
+            var choice = MessageBox.Show(this,
+                "Restore Windows protected audio after removing DSPi from the last attached output? This applies to all outputs.",
+                "Remove DSPi", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
+            if (choice == DialogResult.Cancel) return;
+            restoreProtection = choice == DialogResult.Yes;
+        }
         busy = true;
         UpdateStatus();
         status.Text = removeAttachment ? "Removing DSPi and restarting Windows Audio…" :
@@ -298,13 +309,24 @@ internal sealed class SetupWindow : Form
         string result;
         try
         {
-            if (removeAttachment) await OutputSetup.RemoveAsync(output);
+            if (removeAttachment)
+            {
+                int outcome = await OutputSetup.RemoveAsync(output, restoreProtection);
+                result = outcome switch
+                {
+                    0 when restoreProtection => "DSPi was removed. Protected audio is enabled.",
+                    0 => "DSPi was removed. Windows Audio restarted.",
+                    4 => "DSPi was removed. Another output still uses DSPi, so the audio test setting remains on.",
+                    6 => "DSPi was removed. Restart Windows to apply protected audio.",
+                    _ => "DSPi was removed. Setup could not confirm protected audio."
+                };
+            }
             else
             {
                 if (!output.Attached) await OutputSetup.ApplyAsync(output);
                 await OutputSetup.OpenConsoleAsync(output);
+                result = "DSPi Console opened for this output.";
             }
-            result = removeAttachment ? "DSPi was removed. Windows Audio restarted." : "DSPi Console opened for this output.";
         }
         catch (Win32Exception ex) when (ex.NativeErrorCode == 1223) { result = "Administrator approval was canceled."; }
         catch (Exception ex) { result = ex.Message; }

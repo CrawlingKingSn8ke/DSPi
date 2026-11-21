@@ -12,7 +12,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="Program.cs" />
-    <EmbeddedResource Include="Bootstrap.ps1;Admin.ps1;Worker.ps1;ProtectedStorage.psm1;SharedComponent.psm1" />
+    <EmbeddedResource Include="Bootstrap.ps1;Admin.ps1;Worker.ps1;ProtectedStorage.psm1;SharedComponent.psm1;AudioProtection.psm1" />
     <EmbeddedResource Include="$(DspiApoBinary)" LogicalName="DspiSetup.Payload.Apo.dll" />
     <Content Include="$(DspiPowerShellArchive)" Link="PowerShell-runtime.zip" ExcludeFromSingleFile="true" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>

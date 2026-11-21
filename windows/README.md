@@ -6,7 +6,7 @@ DSPi for Windows applies parametric EQ and other DSPi effects to shared-mode aud
 
 Complete [Enable local audio testing](#enable-local-audio-testing) before installing this unsigned x64 preview.
 
-1. Download the Windows preview ZIP from the [Windows preview release](https://github.com/CrawlingKingSn8ke/DSPi/releases/tag/windows-preview-2026-11-21) and extract the entire folder. Keep `DSPi Setup.exe`, `PowerShell-runtime.zip`, and the `Console` folder together.
+1. Download the Windows preview ZIP from the [Windows preview release](https://github.com/CrawlingKingSn8ke/DSPi/releases/tag/windows-preview-2026-11-21.2) and extract the entire folder. Keep `DSPi Setup.exe`, `PowerShell-runtime.zip`, and the `Console` folder together.
 2. Open **DSPi Setup.exe**, select the output your Windows apps will use, and choose **Attach and open Console**.
 3. Approve the Windows administrator prompt. Setup briefly restarts Windows Audio and opens the Console. The tested install path needs no PC reboot.
 4. In Windows Sound settings, route playback to the selected device. Play audio and check the Console meters or spectrum display. For a quick check, try a gentle EQ cut and toggle **Bypass**.
@@ -61,6 +61,10 @@ reg.exe add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Audio" /v DisablePro
 Setup restarts Windows Audio during attachment. If the APO still fails to load after attachment, restart Windows once and check the Console meters again.
 
 ## Restore protected audio after testing
+
+In the updated Console, choose **Detach DSPi from Output** and select **Restore protected audio if this is the last DSPi output**. The **Remove DSPi** button in Setup offers the same choice. If another output still has DSPi attached, the audio test setting stays on. After the last detachment, the choice removes the test override and restarts Windows Audio. If Windows cannot restart the audio service, the Console or Setup asks you to restart Windows.
+
+Use the manual steps below with older builds or to restore a specific previous registry value.
 
 1. Open **DSPi Setup.exe**, select the attached output, and choose **Remove DSPi**. Repeat for each output you attached.
 2. In an administrator terminal, restore the original registry state. If the value was absent, delete just that value.

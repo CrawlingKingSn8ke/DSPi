@@ -190,11 +190,19 @@ public sealed partial class MainWindow
     private async Task DetachWindowsApoAsync(string endpointId, XamlRoot? owner = null)
     {
         if (_softwareFileBusy) return;
+        var restoreProtection = new CheckBox { Content = "Restore protected audio if this is the last DSPi output" };
+        var content = new StackPanel { Spacing = 10 };
+        content.Children.Add(new TextBlock
+        {
+            Text = "Windows asks for administrator approval and briefly interrupts playback. Restoring protected audio applies to all outputs.",
+            TextWrapping = TextWrapping.Wrap
+        });
+        content.Children.Add(restoreProtection);
         var confirmation = new ContentDialog
         {
             XamlRoot = owner ?? Content.XamlRoot,
             Title = "Detach DSPi from this output?",
-            Content = "Windows asks for administrator approval and briefly interrupts playback. Your saved DSPi profile remains available.",
+            Content = content,
             PrimaryButtonText = "Detach DSPi",
             CloseButtonText = "Cancel",
             DefaultButton = ContentDialogButton.Close
@@ -204,12 +212,13 @@ public sealed partial class MainWindow
         await ViewModel.FlushSoftwareWritesAsync();
         _softwareFileBusy = true;
         ApplySoftwareMenuState();
+        int exitCode;
         try
         {
-            int exitCode = await DetachWindowsEffectAsync(endpointId);
+            exitCode = await DetachWindowsEffectAsync(endpointId, restoreProtection.IsChecked == true);
             if (exitCode == 2) throw new InvalidOperationException("No active DSPi installation with protected recovery was found for this output.");
             if (exitCode == 3) throw new InvalidOperationException("Windows detached DSPi but cleanup still needs attention. Run protected recovery to finish.");
-            if (exitCode != 0) throw new InvalidOperationException("DSPi removal could not be verified. Check the protected recovery status.");
+            if (exitCode is not (0 or 4 or 5 or 6)) throw new InvalidOperationException("DSPi removal could not be verified. Check the protected recovery status.");
         }
         finally
         {
@@ -218,10 +227,46 @@ public sealed partial class MainWindow
         }
         if (ViewModel.Device.WindowsApoEndpointId == endpointId)
             await DisconnectWindowsApoAsync();
+
+        string? notice = exitCode switch
+        {
+            4 => "Another output still uses DSPi, so the audio test setting remains on.",
+            5 => "DSPi was detached, but secure Windows audio protection could not be confirmed.",
+            6 => "DSPi was detached. Restart Windows to apply protected audio.",
+            _ => null
+        };
+        if (notice != null)
+        {
+            var outcome = new ContentDialog
+            {
+                XamlRoot = owner ?? Content.XamlRoot,
+                Title = "DSPi detached",
+                Content = notice,
+                CloseButtonText = "OK"
+            };
+            await outcome.ShowAsync();
+        }
     }
 
-    private static async Task<int> DetachWindowsEffectAsync(string endpointId)
+    private static async Task<int> DetachWindowsEffectAsync(string endpointId, bool restoreProtection)
     {
+        const string prefix = "{0.0.0.00000000}.";
+        if (!endpointId.StartsWith(prefix, StringComparison.Ordinal) ||
+            !Guid.TryParseExact(endpointId[prefix.Length..], "B", out var endpointGuid))
+            throw new InvalidOperationException("The selected Windows output could not be identified.");
+
+        string? setupFolder = Directory.GetParent(Path.TrimEndingDirectorySeparator(AppContext.BaseDirectory))?.FullName;
+        string? setup = setupFolder == null ? null : Path.Combine(setupFolder, "DSPi Setup.exe");
+        if (setup != null && File.Exists(setup))
+        {
+            var launch = new ProcessStartInfo(setup) { UseShellExecute = false, WorkingDirectory = setupFolder! };
+            launch.ArgumentList.Add(restoreProtection ? "--remove-and-restore-audio" : "--remove");
+            launch.ArgumentList.Add(endpointGuid.ToString("B"));
+            using var installer = Process.Start(launch) ?? throw new InvalidOperationException("Could not open DSPi Setup.");
+            await installer.WaitForExitAsync();
+            if (installer.ExitCode != 2) return installer.ExitCode;
+        }
+
         string host = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "PowerShell", "7", "pwsh.exe");
         if (!File.Exists(host))
             throw new InvalidOperationException("PowerShell 7 is required for DSPi recovery.");
@@ -229,7 +274,14 @@ public sealed partial class MainWindow
             ?? throw new InvalidOperationException("The DSPi recovery command is missing.");
         using var reader = new StreamReader(resource);
         string selection = Convert.ToBase64String(Encoding.UTF8.GetBytes(endpointId));
-        string script = "$endpoint=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + selection + "'))\n" + await reader.ReadToEndAsync();
+        using var protection = typeof(MainWindow).Assembly.GetManifestResourceStream("DSPiConsole.AudioProtection.psm1")
+            ?? throw new InvalidOperationException("The Windows audio protection command is missing.");
+        using var protectionReader = new StreamReader(protection);
+        string module = Convert.ToBase64String(Encoding.UTF8.GetBytes(await protectionReader.ReadToEndAsync()));
+        string script = "$endpoint=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + selection + "'))\n" +
+            "$restoreProtection=$" + (restoreProtection ? "true" : "false") + "\n" +
+            "New-Module -Name DspiAudioProtection -ScriptBlock ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" +
+            module + "')))) | Import-Module\n" + await reader.ReadToEndAsync();
         var start = new ProcessStartInfo(host)
         {
             UseShellExecute = true,

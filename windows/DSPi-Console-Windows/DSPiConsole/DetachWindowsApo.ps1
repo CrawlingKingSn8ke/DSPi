@@ -53,6 +53,7 @@ try {
     }
     if (!$result.RolledBack) { $result = & $recovery }
     if (!$result.RolledBack) { exit 3 }
+    if ($restoreProtection) { exit (Complete-DspiAudioProtection) }
     exit 0
 } catch { exit 1 }
 

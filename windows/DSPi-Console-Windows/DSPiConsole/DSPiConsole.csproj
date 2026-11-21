@@ -26,6 +26,7 @@
   <ItemGroup>
     <Content Remove="Assets\screenshot.png" />
     <EmbeddedResource Include="DetachWindowsApo.ps1" LogicalName="DSPiConsole.DetachWindowsApo.ps1"/>
+    <EmbeddedResource Include="..\Setup\DSPi.EndpointSetup\AudioProtection.psm1" LogicalName="DSPiConsole.AudioProtection.psm1" />
     <Content Include="..\..\DSPi-Software-DSP\build\dspi-host.dll" Link="dspi-host.dll">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
