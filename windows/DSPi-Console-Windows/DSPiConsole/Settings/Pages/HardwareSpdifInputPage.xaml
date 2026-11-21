@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<settings:SettingsModule
+    x:Class="DSPiConsole.Settings.Pages.HardwareSpdifInputPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:settings="using:DSPiConsole.Settings"
+    xmlns:controls="using:CommunityToolkit.WinUI.Controls">
+
+    <!--
+        S/PDIF page — the receive side. S/PDIF *outputs* are a per-slot output
+        type and are set on Hardware › Main Outputs, with the rest of the slots.
+          - Instances: number of selectable S/PDIF inputs sharing one receiver
+            (firmware v1.1.5+; hidden on older firmware). Driving the count
+            enables/disables the optional inputs. How many the firmware offers
+            is device-reported (3 before wire V28, 4 from V28), so the fourth
+            entry and card only appear when the device has them.
+          - One RX pin card per active input; hot-swappable while active.
+          - LG Sound Sync — V8+ firmware.
+        Page only registered when firmware V7+ exposes SPDIF input capability.
+    -->
+    <StackPanel Spacing="4">
+
+        <controls:SettingsCard x:Name="InstancesCard"
+                               Header="Instances"
+                               Description="Number of selectable S/PDIF inputs sharing one receiver. Each needs its own GPIO."
+                               Visibility="Collapsed">
+            <ComboBox x:Name="InstancesCombo" MinWidth="80" SelectionChanged="OnInstancesChanged">
+                <ComboBoxItem Content="1" Tag="1"/>
+                <ComboBoxItem Content="2" Tag="2"/>
+                <ComboBoxItem Content="3" Tag="3"/>
+                <ComboBoxItem x:Name="Instances4Item" Content="4" Tag="4" Visibility="Collapsed"/>
+            </ComboBox>
+        </controls:SettingsCard>
+
+        <controls:SettingsCard x:Name="RxPinCard0" Header="S/PDIF 1 Input"
+                               Description="GPIO pin for the first S/PDIF input.">
+            <ComboBox x:Name="RxPinCombo0" MinWidth="140" SelectionChanged="OnSpdifRxPinChanged"/>
+        </controls:SettingsCard>
+
+        <controls:SettingsCard x:Name="RxPinCard1" Header="S/PDIF 2 Input"
+                               Description="GPIO pin for the second S/PDIF input."
+                               Visibility="Collapsed">
+            <ComboBox x:Name="RxPinCombo1" MinWidth="140" SelectionChanged="OnSpdifRxPinChanged"/>
+        </controls:SettingsCard>
+
+        <controls:SettingsCard x:Name="RxPinCard2" Header="S/PDIF 3 Input"
+                               Description="GPIO pin for the third S/PDIF input."
+                               Visibility="Collapsed">
+            <ComboBox x:Name="RxPinCombo2" MinWidth="140" SelectionChanged="OnSpdifRxPinChanged"/>
+        </controls:SettingsCard>
+
+        <controls:SettingsCard x:Name="RxPinCard3" Header="S/PDIF 4 Input"
+                               Description="GPIO pin for the fourth S/PDIF input."
+                               Visibility="Collapsed">
+            <ComboBox x:Name="RxPinCombo3" MinWidth="140" SelectionChanged="OnSpdifRxPinChanged"/>
+        </controls:SettingsCard>
+
+        <controls:SettingsCard x:Name="LgSoundSyncCard"
+                                Header="LG Sound Sync"
+                                Description="Decode volume control from LG TVs.">
+            <ToggleSwitch x:Name="LgSoundSyncToggle"
+                          OnContent="On" OffContent="Off"
+                          Toggled="OnLgSoundSyncToggled"/>
+        </controls:SettingsCard>
+
+        <StackPanel Orientation="Horizontal" Spacing="6">
+            <TextBlock x:Name="StatusText"
+                       FontSize="11"
+                       TextWrapping="Wrap"
+                       VerticalAlignment="Center"
+                       Visibility="Collapsed"/>
+            <!-- Shown only for a pin conflict, by ShowPinConflict: an eye
+                 that takes you to the control already holding the pin. -->
+            <Button x:Name="StatusPinButton" Visibility="Collapsed"
+                    Background="Transparent" BorderThickness="0"
+                    Padding="4,0,4,0" MinWidth="0" MinHeight="0"
+                    VerticalAlignment="Center">
+                <FontIcon Glyph="&#xE7B3;" FontSize="13"/>
+            </Button>
+        </StackPanel>
+    </StackPanel>
+</settings:SettingsModule>

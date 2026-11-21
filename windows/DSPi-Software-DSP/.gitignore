@@ -1,0 +1,8 @@
+build/
+.tools/
+*.wav
+*.obj
+*.pdb
+*.ilk
+**/bin/
+**/obj/

@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>DSPi Setup</AssemblyName>
+    <DspiApoBinary Condition="'$(DspiApoBinary)' == ''">$(MSBuildThisFileDirectory)..\..\..\DSPi-Software-DSP\build\dspi-apo.dll</DspiApoBinary>
+    <DspiPowerShellArchive Condition="'$(DspiPowerShellArchive)' == ''">$(MSBuildThisFileDirectory)PowerShell-runtime.zip</DspiPowerShellArchive>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <EmbeddedResource Include="Bootstrap.ps1;Admin.ps1;Worker.ps1;ProtectedStorage.psm1;SharedComponent.psm1" />
+    <EmbeddedResource Include="$(DspiApoBinary)" LogicalName="DspiSetup.Payload.Apo.dll" />
+    <Content Include="$(DspiPowerShellArchive)" Link="PowerShell-runtime.zip" ExcludeFromSingleFile="true" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

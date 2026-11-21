@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Platforms>x86;x64;ARM64</Platforms>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="LibUsbDotNet" Version="3.0.102-alpha" />
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.2.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="DSPiConsole.Software.Tests" />
+    <ProjectReference Include="..\DSPiConsole.Core\DSPiConsole.Core.csproj" />
+    <ProjectReference Include="..\..\DSPi-Software-DSP\managed\Dspi.Software\Dspi.Software.csproj" />
+    <ProjectReference Include="..\..\DSPi-Software-DSP\managed\Dspi.Apo\Dspi.Apo.csproj" />
+  </ItemGroup>
+
+</Project>

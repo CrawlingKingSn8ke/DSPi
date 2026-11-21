@@ -1,0 +1,21 @@
+# Windows live audio transport
+
+The library targets .NET 8 on Windows and pins `NAudio.Wasapi` 2.2.1 (with its `NAudio.Core` dependency). It does not depend on NAudio's WinForms package. Creating a `LiveAudioService` and enumerating endpoints never starts recording or playback. `StartAsync` requires explicit capture and render endpoint IDs; it never selects defaults or switches endpoints automatically.
+
+## Route an application through VB-CABLE
+
+Install VB-Audio's official VB-CABLE driver separately, following its installer/restart instructions. This project does not install a driver. Set the application's playback destination to **CABLE Input (VB-Audio Virtual Cable)** in Windows sound settings. In DSPi select **CABLE Output (VB-Audio Virtual Cable)** as capture, then select a physical DAC/soundcard as render. Leave Windows "Listen to this device" disabled for the cable to avoid a second unprocessed path. Start explicitly in DSPi; Stop ends both streams. Applications that bypass Windows shared playback must be configured separately to send audio to the cable.
+
+The actual machine inspected during development had TOPPING, Realtek, DSPi and NVIDIA render endpoints and **no active capture/virtual-cable endpoint**. End-to-end physical audio was therefore not tested. `Dspi.Audio.Windows.Tests --list-devices` inventories active endpoints without opening capture/playback streams. Endpoint names are only a cable hint; users must choose the intended endpoint explicitly.
+
+## Formats, buffering and lifecycle
+
+Capture uses the selected endpoint's actual shared mix format. Supported formats are signed little-endian PCM 16/24/32-bit and IEEE float32, including extensible PCM valid-bit precision (left-aligned), at 8–192 kHz and 1–8 channels. Enumeration includes endpoints outside these limits, but Start rejects unsupported or malformed capture/render formats after querying metadata and before either stream starts. Capture callbacks decode preallocated chunks of up to 4096 frames and enqueue them; DSP executes on the render thread. The render provider supplies float32 at the playback mix rate and channel count, always returns all requested bytes, and clears unfilled bytes to silence. Core owns the fixed 48 kHz DSP, resampling, channel map, priming and drift correction. WASAPI shared mode may additionally convert float samples to the physical endpoint's native sample representation.
+
+Default pipeline target buffering is 60 ms; default shared-device latency request is 20 ms. These are requests, not a guarantee of total round-trip latency. Windows/device scheduling and the cable/application buffers add latency. Device buffer requests are limited to 10–500 ms. Normal Stop asks Core for its short fade and allows a bounded drain interval (twice the device request plus 20 ms, capped at 250 ms) before stopping and joining callbacks. Faults stop immediately. Await `StopAsync` before releasing the DSP processing lease. Error and Stopped events run on a worker thread after fault cleanup; UI handlers must dispatch to their UI thread.
+
+Removal, disabling, endpoint configuration/property changes, and stream failures stop the selected session and require an explicit restart. Changing the Windows default endpoint does not reroute the session. Generation checks ignore callbacks from older sessions. Endpoint property notifications are deliberately conservative: even an unrelated property change can require a restart. `ExpectedCaptureChannels` can bind the UI's DSP lease to the enumerated capture layout and rejects a layout change during startup.
+
+Tests use a fake backend for lifecycle/device loss and exercise PCM decoding without physical audio. They are a console executable and need no test framework package. Physical-device scheduling, exclusive-mode applications, hot-unplug behavior on specific drivers, and audible latency/quality still require listening tests on a configured system.
+
+Implementation references: official NAudio [v2.2.1 WasapiCapture](https://github.com/naudio/NAudio/blob/v2.2.1/NAudio.Wasapi/WasapiCapture.cs), [WasapiOut](https://github.com/naudio/NAudio/blob/v2.2.1/NAudio.Wasapi/WasapiOut.cs), and [WaveFormatExtensible](https://github.com/naudio/NAudio/blob/v2.2.1/NAudio.Core/Wave/WaveFormats/WaveFormatExtensible.cs).

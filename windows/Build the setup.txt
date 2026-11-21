@@ -1,0 +1,4 @@
+Build the DSP engine with DSPi-Software-DSP/build.ps1, then build its APO with scripts/build-apo.ps1.
+Pass the APO path as DspiApoBinary and the bundled ZIP path as DspiPowerShellArchive when publishing DSPi.EndpointSetup.
+The local-development admin and worker scripts pin the tested APO SHA-256. Review and update those pins for a rebuilt DLL.
+Publish the Console separately as self-contained win-x64 and place its files in the Console subfolder.

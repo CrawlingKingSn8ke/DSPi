@@ -1,0 +1,194 @@
+<UserControl
+    x:Class="DSPiConsole.Controls.DacHwMuteControl"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!--
+        Self-contained "External DAC Hardware Mute" module for the Settings
+        dialog's Global tab. Uses a WinUI Expander as the visual container:
+        the chevron + animated expand/collapse + bordered card make it
+        obvious at a glance that this is a section with sub-options that
+        belong to the enable toggle.
+
+        Header content:
+          • Section title + brief subtitle on the left (always visible).
+          • Enable ToggleSwitch on the right — the section's primary control.
+
+        Expander state is synchronized with the toggle in code-behind so that:
+          • Flipping the toggle expands or collapses the section.
+          • Clicking the chevron expands or collapses AND toggles enable.
+        Both interactions feel equivalent because they target the same field.
+
+        Three apply cadences:
+          • Enable + Polarity + Pin → immediate (toggles and pickers commit
+            on click; users expect instant feedback for binary choices).
+          • Hold ms + Release ms → debounced 300 ms (sliders fire continuously
+            during drag; the firmware persists each SET to flash, so we
+            coalesce until the user pauses or releases).
+          • Test pulse → on click, with brief status feedback.
+
+        Visibility states (handled in Refresh):
+          • Supported + Enabled  → Expander expanded, controls visible.
+          • Supported + Disabled → Expander collapsed; chevron + toggle row only.
+          • Unsupported          → Toggle disabled, Expander forced expanded
+                                   so the user can see the notice explaining
+                                   why the controls are unavailable.
+    -->
+    <Expander x:Name="SectionExpander" HorizontalAlignment="Stretch">
+        <Expander.Header>
+            <!--
+                Three-column header, left-aligned: title (Auto) immediately
+                followed by the enable toggle (Auto with a small left margin
+                for breathing room), then a star-width spacer that absorbs
+                the rest of the header so everything stays packed on the
+                left and the Expander template's chevron sits at its usual
+                right-edge position. The toggle does NOT drive expansion;
+                the chevron is a pure peek action and only the toggle
+                itself changes enable state.
+            -->
+            <Grid Margin="0,8,0,8">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0"
+                           Text="External DAC Hardware Mute"
+                           FontSize="14" FontWeight="SemiBold"
+                           VerticalAlignment="Center"/>
+                <ToggleSwitch x:Name="EnableToggle" Grid.Column="1"
+                              OnContent="" OffContent="" MinWidth="0"
+                              Margin="16,0,0,0"
+                              VerticalAlignment="Center">
+                    <!--
+                        Zero the gap the template places between the knob
+                        and the (empty) OnContent/OffContent slot. With the
+                        toggle now left-aligned, this just keeps it compact.
+                    -->
+                    <ToggleSwitch.Resources>
+                        <Thickness x:Key="ToggleSwitchContentMargin">0,0,0,0</Thickness>
+                    </ToggleSwitch.Resources>
+                </ToggleSwitch>
+            </Grid>
+        </Expander.Header>
+
+        <StackPanel Spacing="14" Margin="0,4,0,4">
+
+            <!-- Replaces the controls below when the connected firmware
+                 predates V10 / STALLs REQ_GET_DAC_HW_MUTE_CONFIG. -->
+            <Border x:Name="UnsupportedNotice"
+                    Padding="12,8"
+                    Background="{ThemeResource SubtleFillColorTertiaryBrush}"
+                    BorderBrush="{ThemeResource DividerStrokeColorDefaultBrush}"
+                    BorderThickness="1"
+                    CornerRadius="4"
+                    Visibility="Collapsed">
+                <TextBlock Text="Not supported by this firmware. Update to V10 or newer to enable hardware-mute control."
+                           FontSize="12"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                           TextWrapping="Wrap"/>
+            </Border>
+
+            <!-- Configurable sub-options. Hidden only when the device
+                 doesn't support the feature; otherwise visible whenever
+                 the Expander is open (the Expander itself handles the
+                 collapse animation when the toggle/chevron is flipped).
+                 Compact one-line-per-setting layout: fixed-width label
+                 column for visual alignment, hover tooltips for context
+                 instead of verbose inline help text. -->
+            <StackPanel x:Name="CollapsibleContent" Spacing="8">
+
+                <Grid ColumnSpacing="12"
+                      ToolTipService.ToolTip="Drive the mute GPIO LOW (PCM5102A, WM8741) or HIGH (AK4493 default) to mute the DAC.">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="110"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="Polarity" FontSize="12" VerticalAlignment="Center"/>
+                    <!-- Two-item dropdown; SelectedIndex maps directly to
+                         DacHwMuteConfig.ActiveLow (0 = true, 1 = false).
+                         ComboBox matches the GPIO Pin row's visual idiom and
+                         keeps the section's controls uniform. MaxWidth pins
+                         the closed-state size and, by extension, the popup
+                         width — without it the popup can be wider than the
+                         ComboBox itself, which triggers a layout pass that
+                         ContentDialog reacts to when the dropdown opens. -->
+                    <ComboBox x:Name="PolarityCombo" Grid.Column="1"
+                              HorizontalAlignment="Stretch" MaxWidth="240">
+                        <ComboBoxItem Content="Active Low"/>
+                        <ComboBoxItem Content="Active High"/>
+                    </ComboBox>
+                </Grid>
+
+                <Grid ColumnSpacing="12"
+                      ToolTipService.ToolTip="GPIO pin connected to the DAC's mute input (PCM5102A XSMT, WM8741 MUTEB, AK4493 SMUTE).">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="110"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="GPIO Pin" FontSize="12" VerticalAlignment="Center"/>
+                    <!-- See PolarityCombo's note on MaxWidth — same rationale.
+                         240 fits the longest expected item ("GPIO XX (OWNER)"
+                         where OWNER is up to ~10 chars). Wider items get
+                         truncated by the ComboBox's own ellipsis behavior. -->
+                    <ComboBox x:Name="PinCombo" Grid.Column="1"
+                              HorizontalAlignment="Stretch" MaxWidth="240"/>
+                </Grid>
+
+                <Grid ColumnSpacing="12"
+                      ToolTipService.ToolTip="Milliseconds the mute pin is held asserted before clocks stop. Recommended: 5 (PCM5102A), 100 (WM8741, AK4493).">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="110"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="Hold (ms)" FontSize="12" VerticalAlignment="Center"/>
+                    <Slider x:Name="HoldMsSlider" Grid.Column="1"
+                            Minimum="0" Maximum="500" StepFrequency="1"
+                            SmallChange="1" LargeChange="10"
+                            IsThumbToolTipEnabled="False"
+                            VerticalAlignment="Center"/>
+                    <TextBlock x:Name="HoldMsText" Grid.Column="2"
+                               FontFamily="Cascadia Code, Consolas" FontSize="12"
+                               TextAlignment="Right" MinWidth="36"
+                               VerticalAlignment="Center"/>
+                </Grid>
+
+                <Grid ColumnSpacing="12"
+                      ToolTipService.ToolTip="Milliseconds to dwell after releasing the mute pin before resuming audio. Usually 0.">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="110"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="Release (ms)" FontSize="12" VerticalAlignment="Center"/>
+                    <Slider x:Name="ReleaseMsSlider" Grid.Column="1"
+                            Minimum="0" Maximum="500" StepFrequency="1"
+                            SmallChange="1" LargeChange="10"
+                            IsThumbToolTipEnabled="False"
+                            VerticalAlignment="Center"/>
+                    <TextBlock x:Name="ReleaseMsText" Grid.Column="2"
+                               FontFamily="Cascadia Code, Consolas" FontSize="12"
+                               TextAlignment="Right" MinWidth="36"
+                               VerticalAlignment="Center"/>
+                </Grid>
+
+                <Grid ColumnSpacing="12" Margin="0,4,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="110"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <Button x:Name="TestButton" Content="Test Pulse"
+                            HorizontalAlignment="Stretch"
+                            ToolTipService.ToolTip="Fire a ~1 second mute pulse for installer verification."/>
+                    <TextBlock x:Name="TestFeedback" Grid.Column="1"
+                               FontSize="11"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               VerticalAlignment="Center"
+                               TextTrimming="CharacterEllipsis"/>
+                </Grid>
+
+            </StackPanel>
+        </StackPanel>
+    </Expander>
+</UserControl>

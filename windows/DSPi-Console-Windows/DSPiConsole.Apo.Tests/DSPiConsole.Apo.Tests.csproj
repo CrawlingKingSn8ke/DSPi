@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><Platforms>x64</Platforms>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\DSPiConsole.Usb\DSPiConsole.Usb.csproj" />
+    <ProjectReference Include="..\..\DSPi-Software-DSP\managed\Dspi.Apo\Dspi.Apo.csproj" />
+    <ProjectReference Include="..\..\DSPi-Software-DSP\managed\Dspi.Audio.Windows\Dspi.Audio.Windows.csproj" />
+    <Content Include="..\..\DSPi-Software-DSP\build\dspi-host.dll" Link="dspi-host.dll" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

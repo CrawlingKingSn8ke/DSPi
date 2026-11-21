@@ -1,0 +1,60 @@
+; UNSIGNED ENGINEERING DRAFT. NOT VALIDATED FOR INSTALLATION.
+; Adapted from Microsoft Windows-driver-samples SYSVAD; see provenance/ license.
+[Version]
+Signature="$WINDOWS NT$"
+Class=SoftwareComponent
+ClassGuid={5c4c3332-344d-483c-8739-259e934c9cc8}
+Provider=%Provider%
+DriverVer=11/17/2026,0.1.0.0
+CatalogFile=dspi-apo-component.cat
+PnpLockDown=1
+
+[Manufacturer]
+%Provider%=Components,NTamd64.10.0.1..19041,NTamd64.10.0.1..22000
+[Components.NTamd64.10.0.1..19041]
+%Description%=DspiApo,SWC\VEN_DSPI&CID_E53F75EF
+; Empty closest-match models prevent Windows11 22000+ using the Windows10 model.
+[Components.NTamd64.10.0.1..22000]
+
+[DspiApo.NT]
+CopyFiles=Apo.Copy
+AddReg=Apo.Register
+[DspiApo.NT.Services]
+AddService=,2
+[Apo.Copy]
+dspi-apo.dll
+[Apo.Register]
+HKR,Classes\CLSID\%Clsid%,,,%Description%
+HKR,Classes\CLSID\%Clsid%\InProcServer32,,0x00020000,%13%\dspi-apo.dll
+HKR,Classes\CLSID\%Clsid%\InProcServer32,ThreadingModel,,Both
+HKR,AudioEngine\AudioProcessingObjects\%Clsid%,FriendlyName,,%Description%
+HKR,AudioEngine\AudioProcessingObjects\%Clsid%,Copyright,,"DSPi contributors, GPL-3.0"
+HKR,AudioEngine\AudioProcessingObjects\%Clsid%,MajorVersion,0x00010001,0
+HKR,AudioEngine\AudioProcessingObjects\%Clsid%,MinorVersion,0x00010001,1
+HKR,AudioEngine\AudioProcessingObjects\%Clsid%,Flags,0x00010001,0x0000000e
+HKR,AudioEngine\AudioProcessingObjects\%Clsid%,MinInputConnections,0x00010001,1
+HKR,AudioEngine\AudioProcessingObjects\%Clsid%,MaxInputConnections,0x00010001,1
+HKR,AudioEngine\AudioProcessingObjects\%Clsid%,MinOutputConnections,0x00010001,1
+HKR,AudioEngine\AudioProcessingObjects\%Clsid%,MaxOutputConnections,0x00010001,1
+HKR,AudioEngine\AudioProcessingObjects\%Clsid%,MaxInstances,0x00010001,0xffffffff
+HKR,AudioEngine\AudioProcessingObjects\%Clsid%,NumAPOInterfaces,0x00010001,4
+HKR,AudioEngine\AudioProcessingObjects\%Clsid%,APOInterface0,,"{fd7f2b29-24d0-4b5c-b177-592c39f9ca10}"
+HKR,AudioEngine\AudioProcessingObjects\%Clsid%,APOInterface1,,"{0e5ed805-aba6-49c3-8f9a-2b8c889c4fa8}"
+HKR,AudioEngine\AudioProcessingObjects\%Clsid%,APOInterface2,,"{9e1d6a6d-ddbc-4e95-a4c7-ad64ba37846c}"
+HKR,AudioEngine\AudioProcessingObjects\%Clsid%,APOInterface3,,"{5fa00f27-add6-499a-8a9d-6b98521fa75b}"
+
+[SourceDisksNames]
+1=%Disk%
+[SourceDisksFiles]
+dspi-apo.dll=1
+[DestinationDirs]
+Apo.Copy=13
+[SignatureAttributes]
+dspi-apo.dll=SignatureAttributes.PETrust
+[SignatureAttributes.PETrust]
+PETrust=true
+[Strings]
+Provider="DSPi contributors"
+Description="DSPi Standalone APO (development)"
+Disk="DSPi unsigned review package"
+Clsid="{e53f75ef-9901-4ec4-a8d1-2fe2606a7431}"

@@ -1,0 +1,65 @@
+; UNSIGNED ENGINEERING DRAFT. NOT VALIDATED FOR INSTALLATION.
+; GLOBAL/FX0 endpoint association and scope require proof before use.
+; Adapted from Microsoft Windows-driver-samples SYSVAD; see provenance/ license.
+[Version]
+Signature="$WINDOWS NT$"
+Class=Extension
+ClassGuid={e2f84ce7-8efa-411c-aa69-97454ca4cb57}
+ExtensionId={cd0342e6-b64b-43f4-b34a-837cbe123ebd}
+Provider=%Provider%
+DriverVer=11/17/2026,0.1.0.0
+CatalogFile=dspi-usb-extension.cat
+PnpLockDown=1
+
+[Manufacturer]
+%Provider%=Extensions,NTamd64.10.0.1..19041,NTamd64.10.0.1..22000
+[Extensions.NTamd64.10.0.1..19041]
+%Description%=DspiExtension,USB\VID_2E8B&PID_FEAA&REV_0204&MI_00
+%Description%=DspiExtension,USB\VID_2E8B&PID_FEAA&MI_00
+[Extensions.NTamd64.10.0.1..22000]
+
+[DspiExtension.NT]
+[DspiExtension.NT.Components]
+AddComponent=DspiApo,,Dspi.Component
+[Dspi.Component]
+ComponentIDs=VEN_DSPI&CID_E53F75EF
+Description="DSPi Standalone APO (development)"
+[DspiExtension.NT.Interfaces]
+AddInterface=%KSCATEGORY_AUDIO%,GLOBAL,Dspi.AudioInterface
+[Dspi.AudioInterface]
+AddReg=Dspi.Fx
+[Dspi.Fx]
+; FX outranks the entire inbox MSFX store. Represent the exact inspected
+; Windows chain in this new speaker store; do not modify any MSFX key.
+; NOCLOBBER is not atomic installation: a future installer must preflight/recover.
+HKR,FX\0,%PKEY_ASSOCIATION%,0x00000002,%SPEAKER_ASSOCIATION%
+HKR,FX\0,%PKEY_SFX%,0x00000002,%WINDOWS_SFX%
+HKR,FX\0,%PKEY_MFX%,0x00000002,%WINDOWS_MFX%
+HKR,FX\0,%PKEY_SFX_MODES%,0x00010002,%MODE_DEFAULT%
+HKR,FX\0,%PKEY_MFX_MODES%,0x00010002,%MODE_DEFAULT%
+HKR,FX\0,%PKEY_WINDOWS_UI%,0x00000002,%WINDOWS_UI%
+HKR,FX\0,%PKEY_ITEM_DISPLAY%,0x00000002,"Microsoft Audio Home Theater Effects"
+HKR,FX\0,%PKEY_EFX%,0x00000002,%Clsid%
+HKR,FX\0,%PKEY_EFX_MODES%,0x00010002,%MODE_DEFAULT%
+HKR,FX\0,%PKEY_PROFILE%,0x00000002,"@@PROFILE_KEY@@"
+; Exact USB hardware IDs still match every device of this model; no serial targeting.
+[Strings]
+Provider="DSPi contributors"
+Description="DSPi USB audio extension (engineering draft)"
+KSCATEGORY_AUDIO="{6994ad04-93ef-11d0-a3cc-00a0c9223196}"
+SPEAKER_ASSOCIATION="{dff21ce1-f70f-11d0-b917-00a0c9223196}"
+WINDOWS_SFX="{62dc1a93-ae24-464c-a43e-452f824c4250}"
+WINDOWS_MFX="{637c490d-eee3-4c0a-973f-371958802da2}"
+WINDOWS_UI="{5860e1c5-f95c-4a7a-8ec8-8aef24f379a1}"
+PKEY_ASSOCIATION="{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},0"
+PKEY_SFX="{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},5"
+PKEY_MFX="{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},6"
+PKEY_SFX_MODES="{d3993a3f-99c2-4402-b5ec-a92a0367664b},5"
+PKEY_MFX_MODES="{d3993a3f-99c2-4402-b5ec-a92a0367664b},6"
+PKEY_WINDOWS_UI="{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},3"
+PKEY_ITEM_DISPLAY="{b725f130-47ef-101a-a5f1-02608c9eebac},10"
+Clsid="{e53f75ef-9901-4ec4-a8d1-2fe2606a7431}"
+PKEY_EFX="{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},7"
+PKEY_EFX_MODES="{d3993a3f-99c2-4402-b5ec-a92a0367664b},7"
+PKEY_PROFILE="{67fe7ad1-1232-4c16-94ce-83a4f63be981},1"
+MODE_DEFAULT="{c18e2f7e-933d-4965-b7d1-1eef228d2af3}"

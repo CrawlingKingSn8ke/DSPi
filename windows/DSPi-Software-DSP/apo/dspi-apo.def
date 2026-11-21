@@ -1,0 +1,4 @@
+LIBRARY dspi-apo
+EXPORTS
+    DllGetClassObject
+    DllCanUnloadNow
