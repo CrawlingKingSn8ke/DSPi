@@ -4,7 +4,7 @@ DSPi for Windows applies parametric EQ and other DSPi effects to shared-mode aud
 
 ## Install and check playback
 
-This is an **unsigned x64 development preview**. The PC must already allow the local audio development configuration checked by Setup. If Windows rejects the APO, leave its protection settings in place. Administrator approval is required for attachment and removal.
+Complete [Enable local audio testing](#enable-local-audio-testing) before installing this unsigned x64 preview.
 
 1. Download the Windows preview ZIP from the [Windows preview release](https://github.com/CrawlingKingSn8ke/DSPi/releases/tag/windows-preview-2026-11-21) and extract the entire folder. Keep `DSPi Setup.exe`, `PowerShell-runtime.zip`, and the `Console` folder together.
 2. Open **DSPi Setup.exe**, select the output your Windows apps will use, and choose **Attach and open Console**.
@@ -40,6 +40,45 @@ Applications that use exclusive playback or a path outside the Windows shared au
 - For an output attached by Setup, open **DSPi Setup.exe**, select the same output, and choose **Remove DSPi**. Setup uses the saved recovery record to restore the prior endpoint state and restarts Windows Audio.
 
 If you hear audio but see no meters, confirm that Windows and the Console point to the same output and that the app uses shared playback. If Setup does not offer an output, it may already have audio effects or may not be an active physical speaker output.
+
+## Enable local audio testing
+
+This unsigned x64 preview requires a machine-wide Windows audio test setting. Changing it reduces protection for the Windows audio engine across all outputs. Use it on a PC you administer and restore the original setting when you finish testing. Administrator approval is required. [Microsoft APO development notes](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/implementing-audio-processing-objects#disable-use-of-an-embedded-manifest)
+
+1. Open **Windows Terminal** or **Command Prompt** using **Run as administrator**.
+2. Run the query below and note the original value. If Windows reports that the value does not exist, record it as **absent**.
+
+```powershell
+reg.exe query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Audio" /v DisableProtectedAudioDG
+```
+
+3. Set the value to `1`. If the query already shows `0x1`, continue to installation.
+
+```powershell
+reg.exe add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Audio" /v DisableProtectedAudioDG /t REG_DWORD /d 1 /f
+```
+
+Setup restarts Windows Audio during attachment. If the APO still fails to load after attachment, restart Windows once and check the Console meters again.
+
+## Restore protected audio after testing
+
+1. Open **DSPi Setup.exe**, select the attached output, and choose **Remove DSPi**. Repeat for each output you attached.
+2. In an administrator terminal, restore the original registry state. If the value was absent, delete just that value.
+
+```powershell
+reg.exe delete "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Audio" /v DisableProtectedAudioDG /f
+```
+
+   If the original value was `0x0`, set it back to zero.
+
+```powershell
+reg.exe add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Audio" /v DisableProtectedAudioDG /t REG_DWORD /d 0 /f
+```
+
+   If it was already `0x1` and you skipped the change, it is already in its original state. For any other pre-existing DWORD, restore the number you recorded.
+
+3. Restart Windows to apply the restored setting.
+
 
 ## Build and test from source
 
